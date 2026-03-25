@@ -17,6 +17,7 @@ from src.config import (
     _uses_direct_env_provider,
     canonicalize_llm_channel_protocol,
     channel_allows_empty_api_key,
+    get_llm_channel_placeholder_api_key,
     get_configured_llm_models,
     normalize_agent_litellm_model,
     normalize_news_strategy_profile,
@@ -274,7 +275,9 @@ class SystemConfigService:
         resolved_models = [normalize_llm_channel_model(model, resolved_protocol, base_url) for model in raw_models]
         resolved_model = resolved_models[0]
         api_keys = [segment.strip() for segment in api_key.split(",") if segment.strip()]
-        selected_api_key = api_keys[0] if api_keys else ""
+        allow_empty_api_key = channel_allows_empty_api_key(resolved_protocol, base_url)
+        placeholder_api_key = get_llm_channel_placeholder_api_key(resolved_protocol, base_url)
+        selected_api_key = api_keys[0] if api_keys else (placeholder_api_key or "")
 
         call_kwargs: Dict[str, Any] = {
             "model": resolved_model,
@@ -283,7 +286,7 @@ class SystemConfigService:
             "max_tokens": 8,
             "timeout": max(5.0, float(timeout_seconds)),
         }
-        if selected_api_key:
+        if api_keys or allow_empty_api_key:
             call_kwargs["api_key"] = selected_api_key
         if base_url.strip():
             call_kwargs["api_base"] = base_url.strip()

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 改进
+
+- 📰 **daily picks 搜索与降级链路稳态化** — 新增 `BaiduSearchProvider`，可通过 `BAIDU_SEARCH_API_KEY(S)` / `BAIDU_SEARCH_BASE_URL` / `BAIDU_SEARCH_HTTP_METHOD` 作为中文财经热点搜索主链路，并继续保留 SearXNG 等旧 provider 作为回退；daily picks 生成链路改为“新闻 → 板块 → 个股 → 股票池”分层兜底，不再优先退化成行业占位对象。
+- 🇨🇳 **中文新闻检索优先命中 Baidu 风格结果** — 当运行环境尚未配置直连 `BAIDU_SEARCH_API_KEY` 时，`search_stock_news()` 会优先尝试 `SerpAPI` 的 `baidu` engine，再回退到 Tavily；同时对缺失日期的百度结果补齐当天日期，避免被新闻时效过滤误伤。
+- 🧱 **Tushare / JoinQuant 在 daily picks 中的角色收口** — Tushare 在 daily picks 中显式降为补充源，权限不足或积分受限时只记 warning 并自动跳过；新增 `JoinQuantFetcher` 壳子与 `JOINQUANT_*` 配置，作为可选结构化数据补充源，登录失败或 SDK 缺失时 fail-open。
+- 📊 **daily picks 结果元数据与页面可观测性增强** — daily picks 运行结果现在会持久化 `run_status`、`degraded`、`candidate_count`、`output_count`、`confidence`、`risk_note`、`error_summary`、`source_summary` 等元数据；Web `/daily-picks` 页面同步展示最近运行状态、降级标记、数据源摘要、推荐详情与手动触发结果。
+- ⏰ **daily picks scheduler 加固** — `scripts/run_daily_picks_scheduler.py` 增加运行锁、超时控制、失败持久化与最新快照输出；重复触发或子进程超时时不会卡死后续计划执行，并会把失败原因写入 daily picks 运行历史，便于后续排障。
+- ⚡ **daily picks 运行时 provider 熔断与手动触发可用性优化** — quote/board provider 在单次运行内连续空返回时会自动跳过，避免对明显不可用的数据源反复探测；Web 手动触发 daily picks 的请求超时也同步放宽，减少“后台已生成成功但前端先报超时”的假失败。
+
 ## [3.10.1] - 2026-03-24
 
 ### 新功能

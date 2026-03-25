@@ -230,6 +230,16 @@ def channel_allows_empty_api_key(protocol: Optional[str], base_url: Optional[str
     return parsed.hostname in {"127.0.0.1", "localhost", "0.0.0.0"}
 
 
+def get_llm_channel_placeholder_api_key(protocol: Optional[str], base_url: Optional[str]) -> Optional[str]:
+    """Return a placeholder API key for local OpenAI-compatible channels when needed."""
+    resolved_protocol = resolve_llm_channel_protocol(protocol, base_url=base_url)
+    if resolved_protocol == "ollama":
+        return ""
+    if channel_allows_empty_api_key(resolved_protocol, base_url):
+        return "sk-local-placeholder"
+    return None
+
+
 def normalize_llm_channel_model(model: str, protocol: Optional[str], base_url: Optional[str] = None) -> str:
     """Attach a provider prefix when the model omits it."""
     normalized_model = model.strip()
@@ -436,6 +446,10 @@ class Config:
     # === 数据源 API Token ===
     tushare_token: Optional[str] = None
     tickflow_api_key: Optional[str] = None
+    joinquant_enabled: bool = False
+    joinquant_username: Optional[str] = None
+    joinquant_password: Optional[str] = None
+
 
     # === AI 分析配置 ===
     # LiteLLM unified model config (provider/model format, e.g. gemini/gemini-2.5-flash)
@@ -493,6 +507,9 @@ class Config:
     vision_provider_priority: str = "gemini,anthropic,openai"
 
     # === 搜索引擎配置（支持多 Key 负载均衡）===
+    baidu_search_api_keys: List[str] = field(default_factory=list)  # Baidu Search API Keys
+    baidu_search_base_url: str = "https://qianfan.baidubce.com/v2/ai_search/chat/completions"
+    baidu_search_http_method: str = "POST"
     bocha_api_keys: List[str] = field(default_factory=list)  # Bocha API Keys
     minimax_api_keys: List[str] = field(default_factory=list)  # MiniMax API Keys
     tavily_api_keys: List[str] = field(default_factory=list)  # Tavily API Keys
@@ -991,6 +1008,9 @@ class Config:
         )
 
         # 解析搜索引擎 API Keys（支持多个 key，逗号分隔）
+        baidu_keys_str = os.getenv('BAIDU_SEARCH_API_KEYS') or os.getenv('BAIDU_SEARCH_API_KEY', '')
+        baidu_search_api_keys = [k.strip() for k in baidu_keys_str.split(',') if k.strip()]
+
         bocha_keys_str = os.getenv('BOCHA_API_KEYS', '')
         bocha_api_keys = [k.strip() for k in bocha_keys_str.split(',') if k.strip()]
 
@@ -1067,6 +1087,9 @@ class Config:
             feishu_folder_token=os.getenv('FEISHU_FOLDER_TOKEN'),
             tushare_token=os.getenv('TUSHARE_TOKEN'),
             tickflow_api_key=os.getenv('TICKFLOW_API_KEY'),
+            joinquant_enabled=parse_env_bool(os.getenv('JOINQUANT_ENABLED'), default=False),
+            joinquant_username=os.getenv('JOINQUANT_USERNAME') or None,
+            joinquant_password=os.getenv('JOINQUANT_PASSWORD') or None,
             litellm_model=litellm_model,
             litellm_fallback_models=litellm_fallback_models,
             llm_temperature=resolve_unified_llm_temperature(litellm_model),
@@ -1109,6 +1132,9 @@ class Config:
                 or ""
             ),
             vision_provider_priority=os.getenv('VISION_PROVIDER_PRIORITY', 'gemini,anthropic,openai'),
+            baidu_search_api_keys=baidu_search_api_keys,
+            baidu_search_base_url=(os.getenv('BAIDU_SEARCH_BASE_URL') or 'https://qianfan.baidubce.com/v2/ai_search/chat/completions').rstrip('/'),
+            baidu_search_http_method=(os.getenv('BAIDU_SEARCH_HTTP_METHOD') or 'POST').upper(),
             bocha_api_keys=bocha_api_keys,
             minimax_api_keys=minimax_api_keys,
             tavily_api_keys=tavily_api_keys,
@@ -1461,8 +1487,10 @@ class Config:
                     protocol or "unknown",
                 )
 
-            if not api_keys and channel_allows_empty_api_key(protocol, base_url):
-                api_keys = [""]
+            if not api_keys:
+                placeholder_api_key = get_llm_channel_placeholder_api_key(protocol, base_url)
+                if placeholder_api_key is not None:
+                    api_keys = [placeholder_api_key]
 
             if not api_keys:
                 _logger.warning(f"LLM channel '{ch_name}': no API key configured, skipped")
@@ -1761,7 +1789,8 @@ class Config:
     def has_search_capability_enabled(self) -> bool:
         """Whether any search provider is configured or SearXNG fallback is enabled."""
         return bool(
-            self.bocha_api_keys
+            self.baidu_search_api_keys
+            or self.bocha_api_keys
             or self.minimax_api_keys
             or self.tavily_api_keys
             or self.brave_api_keys

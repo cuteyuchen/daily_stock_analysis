@@ -403,6 +403,171 @@ class TavilySearchProvider(BaseSearchProvider):
             return '未知来源'
 
 
+class BaiduSearchProvider(BaseSearchProvider):
+    """Baidu Search provider with configurable endpoint and resilient response parsing."""
+
+    def __init__(self, api_keys: List[str], *, base_url: str, http_method: str = "POST"):
+        super().__init__(api_keys, "BaiduSearch")
+        self._base_url = (base_url or "https://qianfan.baidubce.com/v2/ai_search/chat/completions").rstrip("/")
+        self._http_method = (http_method or "POST").strip().upper()
+
+    @staticmethod
+    def _extract_domain(url: str) -> str:
+        try:
+            from urllib.parse import urlparse
+
+            parsed = urlparse(url)
+            return parsed.netloc.replace("www.", "") or "百度搜索"
+        except Exception:
+            return "百度搜索"
+
+    @staticmethod
+    def _pick_first(container: Dict[str, Any], *keys: str) -> Any:
+        for key in keys:
+            value = container.get(key)
+            if value not in (None, "", []):
+                return value
+        return None
+
+    def _parse_result_items(self, payload: Any, *, query: str, max_results: int) -> List[SearchResult]:
+        if not isinstance(payload, dict):
+            return []
+
+        candidates: List[Dict[str, Any]] = []
+        for raw in (
+            payload.get("results"),
+            payload.get("items"),
+            payload.get("data", {}).get("results") if isinstance(payload.get("data"), dict) else None,
+            payload.get("data", {}).get("items") if isinstance(payload.get("data"), dict) else None,
+            payload.get("organic_results"),
+            payload.get("webPages", {}).get("value") if isinstance(payload.get("webPages"), dict) else None,
+            payload.get("references"),
+            payload.get("citations"),
+        ):
+            if isinstance(raw, list) and raw:
+                candidates = [item for item in raw if isinstance(item, dict)]
+                if candidates:
+                    break
+
+        results: List[SearchResult] = []
+        for item in candidates:
+            url = self._pick_first(item, "url", "link", "href", "target", "sourceUrl")
+            if not isinstance(url, str) or not url.strip():
+                continue
+            title = self._pick_first(item, "title", "name") or query
+            snippet = self._pick_first(item, "snippet", "content", "description", "summary", "abstract") or ""
+            source = self._pick_first(item, "source", "siteName", "site_name", "displayLink") or self._extract_domain(url)
+            published = self._pick_first(
+                item,
+                "published_date",
+                "publishedDate",
+                "date",
+                "time",
+                "pub_time",
+                "publish_time",
+                "datePublished",
+            )
+            if not published:
+                published = datetime.now().strftime("%Y-%m-%d")
+            results.append(
+                SearchResult(
+                    title=str(title),
+                    snippet=str(snippet)[:500],
+                    url=str(url),
+                    source=str(source),
+                    published_date=str(published),
+                )
+            )
+            if len(results) >= max_results:
+                break
+
+        if results:
+            return results
+
+        answer_text = None
+        for path in (
+            payload.get("result"),
+            payload.get("answer"),
+            payload.get("message"),
+            payload.get("data", {}).get("result") if isinstance(payload.get("data"), dict) else None,
+        ):
+            if isinstance(path, str) and path.strip():
+                answer_text = path.strip()
+                break
+
+        if answer_text:
+            return [
+                SearchResult(
+                    title=f"百度搜索摘要：{query}",
+                    snippet=answer_text[:500],
+                    url="https://www.baidu.com/",
+                    source="BaiduSearch",
+                    published_date=datetime.now().strftime("%Y-%m-%d"),
+                )
+            ]
+        return []
+
+    def _build_headers(self, api_key: str) -> Dict[str, str]:
+        return {
+            "Authorization": f"Bearer {api_key}",
+            "X-API-Key": api_key,
+            "Content-Type": "application/json",
+        }
+
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+        payload = {
+            "query": query,
+            "q": query,
+            "keyword": query,
+            "max_results": max_results,
+            "limit": max_results,
+            "top_k": max_results,
+            "days": days,
+            "freshness_days": days,
+        }
+        headers = self._build_headers(api_key)
+        timeout = 15
+        try:
+            if self._http_method == "GET":
+                response = _get_with_retry(self._base_url, headers=headers, params=payload, timeout=timeout)
+            else:
+                response = _post_with_retry(self._base_url, headers=headers, json=payload, timeout=timeout)
+            if response.status_code != 200:
+                return SearchResponse(
+                    query=query,
+                    results=[],
+                    provider=self.name,
+                    success=False,
+                    error_message=SearXNGSearchProvider._parse_http_error(response),
+                )
+            try:
+                data = response.json()
+            except Exception:
+                return SearchResponse(
+                    query=query,
+                    results=[],
+                    provider=self.name,
+                    success=False,
+                    error_message="响应JSON解析失败",
+                )
+            results = self._parse_result_items(data, query=query, max_results=max_results)
+            return SearchResponse(
+                query=query,
+                results=results,
+                provider=self.name,
+                success=True,
+                error_message=None if results else "Baidu Search 返回空结果",
+            )
+        except Exception as e:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=str(e),
+            )
+
+
 class SerpAPISearchProvider(BaseSearchProvider):
     """
     SerpAPI 搜索引擎
@@ -417,6 +582,10 @@ class SerpAPISearchProvider(BaseSearchProvider):
     
     def __init__(self, api_keys: List[str]):
         super().__init__(api_keys, "SerpAPI")
+
+    @staticmethod
+    def _contains_cjk(text: str) -> bool:
+        return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
     
     def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
         """执行 SerpAPI 搜索"""
@@ -443,17 +612,27 @@ class SerpAPISearchProvider(BaseSearchProvider):
             else:
                 tbs = "qdr:y"  # 过去一年
 
-            # 使用 Google 搜索 (获取 Knowledge Graph, Answer Box 等)
-            params = {
-                "engine": "google",
-                "q": query,
-                "api_key": api_key,
-                "google_domain": "google.com.hk", # 使用香港谷歌，中文支持较好
-                "hl": "zh-cn",  # 中文界面
-                "gl": "cn",     # 中国地区偏好
-                "tbs": tbs,     # 时间范围限制
-                "num": max_results # 请求的结果数量，注意：Google API有时不严格遵守
-            }
+            use_baidu_engine = self._contains_cjk(query)
+            if use_baidu_engine:
+                params = {
+                    "engine": "baidu",
+                    "q": query,
+                    "api_key": api_key,
+                    "ie": "utf-8",
+                    "rn": max_results,
+                }
+            else:
+                # 使用 Google 搜索 (获取 Knowledge Graph, Answer Box 等)
+                params = {
+                    "engine": "google",
+                    "q": query,
+                    "api_key": api_key,
+                    "google_domain": "google.com.hk", # 使用香港谷歌，中文支持较好
+                    "hl": "zh-cn",  # 中文界面
+                    "gl": "cn",     # 中国地区偏好
+                    "tbs": tbs,     # 时间范围限制
+                    "num": max_results # 请求的结果数量，注意：Google API有时不严格遵守
+                }
             
             search = GoogleSearch(params)
             response = search.get_dict()
@@ -464,90 +643,92 @@ class SerpAPISearchProvider(BaseSearchProvider):
             # 解析结果
             results = []
             
-            # 1. 解析 Knowledge Graph (知识图谱)
-            kg = response.get('knowledge_graph', {})
-            if kg:
-                title = kg.get('title', '知识图谱')
-                desc = kg.get('description', '')
-                
-                # 提取额外属性
-                details = []
-                for key in ['type', 'founded', 'headquarters', 'employees', 'ceo']:
-                    val = kg.get(key)
-                    if val:
-                        details.append(f"{key}: {val}")
-                        
-                snippet = f"{desc}\n" + " | ".join(details) if details else desc
-                
-                results.append(SearchResult(
-                    title=f"[知识图谱] {title}",
-                    snippet=snippet,
-                    url=kg.get('source', {}).get('link', ''),
-                    source="Google Knowledge Graph"
-                ))
-                
-            # 2. 解析 Answer Box (精选回答/行情卡片)
-            ab = response.get('answer_box', {})
-            if ab:
-                ab_title = ab.get('title', '精选回答')
-                ab_snippet = ""
-                
-                # 财经类回答
-                if ab.get('type') == 'finance_results':
-                    stock = ab.get('stock', '')
-                    price = ab.get('price', '')
-                    currency = ab.get('currency', '')
-                    movement = ab.get('price_movement', {})
-                    mv_val = movement.get('percentage', 0)
-                    mv_dir = movement.get('movement', '')
+            if not use_baidu_engine:
+                # 1. 解析 Knowledge Graph (知识图谱)
+                kg = response.get('knowledge_graph', {})
+                if kg:
+                    title = kg.get('title', '知识图谱')
+                    desc = kg.get('description', '')
                     
-                    ab_title = f"[行情卡片] {stock}"
-                    ab_snippet = f"价格: {price} {currency}\n涨跌: {mv_dir} {mv_val}%"
-                    
-                    # 提取表格数据
-                    if 'table' in ab:
-                        table_data = []
-                        for row in ab['table']:
-                            if 'name' in row and 'value' in row:
-                                table_data.append(f"{row['name']}: {row['value']}")
-                        if table_data:
-                            ab_snippet += "\n" + "; ".join(table_data)
+                    # 提取额外属性
+                    details = []
+                    for key in ['type', 'founded', 'headquarters', 'employees', 'ceo']:
+                        val = kg.get(key)
+                        if val:
+                            details.append(f"{key}: {val}")
                             
-                # 普通文本回答
-                elif 'snippet' in ab:
-                    ab_snippet = ab.get('snippet', '')
-                    list_items = ab.get('list', [])
-                    if list_items:
-                        ab_snippet += "\n" + "\n".join([f"- {item}" for item in list_items])
-                
-                elif 'answer' in ab:
-                    ab_snippet = ab.get('answer', '')
+                    snippet = f"{desc}\n" + " | ".join(details) if details else desc
                     
-                if ab_snippet:
                     results.append(SearchResult(
-                        title=f"[精选回答] {ab_title}",
-                        snippet=ab_snippet,
-                        url=ab.get('link', '') or ab.get('displayed_link', ''),
-                        source="Google Answer Box"
-                    ))
-
-            # 3. 解析 Related Questions (相关问题)
-            rqs = response.get('related_questions', [])
-            for rq in rqs[:3]: # 取前3个
-                question = rq.get('question', '')
-                snippet = rq.get('snippet', '')
-                link = rq.get('link', '')
-                
-                if question and snippet:
-                     results.append(SearchResult(
-                        title=f"[相关问题] {question}",
+                        title=f"[知识图谱] {title}",
                         snippet=snippet,
-                        url=link,
-                        source="Google Related Questions"
-                     ))
+                        url=kg.get('source', {}).get('link', ''),
+                        source="Google Knowledge Graph"
+                    ))
+                    
+                # 2. 解析 Answer Box (精选回答/行情卡片)
+                ab = response.get('answer_box', {})
+                if ab:
+                    ab_title = ab.get('title', '精选回答')
+                    ab_snippet = ""
+                    
+                    # 财经类回答
+                    if ab.get('type') == 'finance_results':
+                        stock = ab.get('stock', '')
+                        price = ab.get('price', '')
+                        currency = ab.get('currency', '')
+                        movement = ab.get('price_movement', {})
+                        mv_val = movement.get('percentage', 0)
+                        mv_dir = movement.get('movement', '')
+                        
+                        ab_title = f"[行情卡片] {stock}"
+                        ab_snippet = f"价格: {price} {currency}\n涨跌: {mv_dir} {mv_val}%"
+                        
+                        # 提取表格数据
+                        if 'table' in ab:
+                            table_data = []
+                            for row in ab['table']:
+                                if 'name' in row and 'value' in row:
+                                    table_data.append(f"{row['name']}: {row['value']}")
+                            if table_data:
+                                ab_snippet += "\n" + "; ".join(table_data)
+                                
+                    # 普通文本回答
+                    elif 'snippet' in ab:
+                        ab_snippet = ab.get('snippet', '')
+                        list_items = ab.get('list', [])
+                        if list_items:
+                            ab_snippet += "\n" + "\n".join([f"- {item}" for item in list_items])
+                    
+                    elif 'answer' in ab:
+                        ab_snippet = ab.get('answer', '')
+                        
+                    if ab_snippet:
+                        results.append(SearchResult(
+                            title=f"[精选回答] {ab_title}",
+                            snippet=ab_snippet,
+                            url=ab.get('link', '') or ab.get('displayed_link', ''),
+                            source="Google Answer Box"
+                        ))
+
+                # 3. 解析 Related Questions (相关问题)
+                rqs = response.get('related_questions', [])
+                for rq in rqs[:3]: # 取前3个
+                    question = rq.get('question', '')
+                    snippet = rq.get('snippet', '')
+                    link = rq.get('link', '')
+                    
+                    if question and snippet:
+                         results.append(SearchResult(
+                            title=f"[相关问题] {question}",
+                            snippet=snippet,
+                            url=link,
+                            source="Google Related Questions"
+                         ))
 
             # 4. 解析 Organic Results (自然搜索结果)
             organic_results = response.get('organic_results', [])
+            default_baidu_published_date = datetime.now().strftime("%Y-%m-%d") if use_baidu_engine else None
 
             for item in organic_results[:max_results]:
                 link = item.get('link', '')
@@ -557,12 +738,12 @@ class SerpAPISearchProvider(BaseSearchProvider):
                 # 策略：如果摘要太短，或者为了获取更多信息，可以请求网页
                 # 这里我们对所有结果尝试获取正文，但为了性能，仅获取前1000字符
                 content = ""
-                if link:
+                if link and not use_baidu_engine:
                    try:
                        fetched_content = fetch_url_content(link, timeout=5)
                        if fetched_content:
-                           # 如果获取到了正文，将其拼接到 snippet 中，或者替换 snippet
-                           # 这里选择拼接，保留原摘要
+                            # 如果获取到了正文，将其拼接到 snippet 中，或者替换 snippet
+                            # 这里选择拼接，保留原摘要
                            content = fetched_content
                            if len(content) > 500:
                                snippet = f"{snippet}\n\n【网页详情】\n{content[:500]}..."
@@ -576,7 +757,7 @@ class SerpAPISearchProvider(BaseSearchProvider):
                     snippet=snippet[:1000], # 限制总长度
                     url=link,
                     source=item.get('source', self._extract_domain(link)),
-                    published_date=item.get('date'),
+                    published_date=item.get('date') or default_baidu_published_date,
                 ))
 
             return SearchResponse(
@@ -1639,6 +1820,9 @@ class SearchService:
     
     def __init__(
         self,
+        baidu_search_keys: Optional[List[str]] = None,
+        baidu_search_base_url: str = "https://qianfan.baidubce.com/v2/ai_search/chat/completions",
+        baidu_search_http_method: str = "POST",
         bocha_keys: Optional[List[str]] = None,
         tavily_keys: Optional[List[str]] = None,
         brave_keys: Optional[List[str]] = None,
@@ -1653,6 +1837,9 @@ class SearchService:
         初始化搜索服务
 
         Args:
+            baidu_search_keys: 百度搜索 API Key 列表
+            baidu_search_base_url: 百度搜索 API 地址
+            baidu_search_http_method: 百度搜索 HTTP 方法（GET/POST）
             bocha_keys: 博查搜索 API Key 列表
             tavily_keys: Tavily API Key 列表
             brave_keys: Brave Search API Key 列表
@@ -1682,32 +1869,43 @@ class SearchService:
         )
 
         # 初始化搜索引擎（按优先级排序）
-        # 1. Bocha 优先（中文搜索优化，AI摘要）
+        # 1. Baidu Search 优先（中文财经热点主链路）
+        if baidu_search_keys:
+            self._providers.append(
+                BaiduSearchProvider(
+                    baidu_search_keys,
+                    base_url=baidu_search_base_url,
+                    http_method=baidu_search_http_method,
+                )
+            )
+            logger.info(f"已配置 Baidu Search，共 {len(baidu_search_keys)} 个 API Key")
+
+        # 2. Bocha（中文搜索优化，AI摘要）
         if bocha_keys:
             self._providers.append(BochaSearchProvider(bocha_keys))
             logger.info(f"已配置 Bocha 搜索，共 {len(bocha_keys)} 个 API Key")
 
-        # 2. Tavily（免费额度更多，每月 1000 次）
+        # 3. Tavily（免费额度更多，每月 1000 次）
         if tavily_keys:
             self._providers.append(TavilySearchProvider(tavily_keys))
             logger.info(f"已配置 Tavily 搜索，共 {len(tavily_keys)} 个 API Key")
 
-        # 3. Brave Search（隐私优先，全球覆盖）
+        # 4. Brave Search（隐私优先，全球覆盖）
         if brave_keys:
             self._providers.append(BraveSearchProvider(brave_keys))
             logger.info(f"已配置 Brave 搜索，共 {len(brave_keys)} 个 API Key")
 
-        # 4. SerpAPI 作为备选（每月 100 次）
+        # 5. SerpAPI 作为备选（每月 100 次）
         if serpapi_keys:
             self._providers.append(SerpAPISearchProvider(serpapi_keys))
             logger.info(f"已配置 SerpAPI 搜索，共 {len(serpapi_keys)} 个 API Key")
 
-        # 5. MiniMax（Coding Plan Web Search，结构化结果）
+        # 6. MiniMax（Coding Plan Web Search，结构化结果）
         if minimax_keys:
             self._providers.append(MiniMaxSearchProvider(minimax_keys))
             logger.info(f"已配置 MiniMax 搜索，共 {len(minimax_keys)} 个 API Key")
 
-        # 6. SearXNG（自建实例优先；未配置时可自动发现公共实例）
+        # 7. SearXNG（自建实例优先；未配置时可自动发现公共实例）
         searxng_provider = SearXNGSearchProvider(
             searxng_base_urls,
             use_public_instances=bool(searxng_public_instances_enabled and not searxng_base_urls),
@@ -2128,9 +2326,24 @@ class SearchService:
             logger.info(f"使用缓存搜索结果: {stock_name}({stock_code})")
             return cached
 
+        providers = list(self._providers)
+        if (
+            re.search(r"[\u4e00-\u9fff]", query)
+            and not any(isinstance(provider, BaiduSearchProvider) for provider in providers)
+        ):
+            original_order = {id(provider): index for index, provider in enumerate(providers)}
+            providers.sort(
+                key=lambda provider: (
+                    0 if isinstance(provider, SerpAPISearchProvider) else
+                    1 if isinstance(provider, TavilySearchProvider) else
+                    2,
+                    original_order[id(provider)],
+                )
+            )
+
         # 依次尝试各个搜索引擎（若过滤后为空，继续尝试下一引擎）
         had_provider_success = False
-        for provider in self._providers:
+        for provider in providers:
             if not provider.is_available:
                 continue
 
@@ -2697,6 +2910,9 @@ def get_search_service() -> SearchService:
         config = get_config()
         
         _search_service = SearchService(
+            baidu_search_keys=getattr(config, 'baidu_search_api_keys', []),
+            baidu_search_base_url=getattr(config, 'baidu_search_base_url', 'https://qianfan.baidubce.com/v2/ai_search/chat/completions'),
+            baidu_search_http_method=getattr(config, 'baidu_search_http_method', 'POST'),
             bocha_keys=config.bocha_api_keys,
             tavily_keys=config.tavily_api_keys,
             brave_keys=config.brave_api_keys,

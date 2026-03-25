@@ -752,29 +752,31 @@ class DataFetcherManager:
           3. BaostockFetcher (Priority 3)
           4. YfinanceFetcher (Priority 4)
         """
-        from .efinance_fetcher import EfinanceFetcher
-        from .akshare_fetcher import AkshareFetcher
-        from .tushare_fetcher import TushareFetcher
-        from .pytdx_fetcher import PytdxFetcher
-        from .baostock_fetcher import BaostockFetcher
-        from .yfinance_fetcher import YfinanceFetcher
-        # 创建所有数据源实例（优先级在各 Fetcher 的 __init__ 中确定）
-        efinance = EfinanceFetcher()
-        akshare = AkshareFetcher()
-        tushare = TushareFetcher()  # 会根据 Token 配置自动调整优先级
-        pytdx = PytdxFetcher()      # 通达信数据源（可配 PYTDX_HOST/PYTDX_PORT）
-        baostock = BaostockFetcher()
-        yfinance = YfinanceFetcher()
+        from src.config import get_config
 
-        # 初始化数据源列表
-        self._fetchers = [
-            efinance,
-            akshare,
-            tushare,
-            pytdx,
-            baostock,
-            yfinance,
-        ]
+        config = get_config()
+        fetchers: List[BaseFetcher] = []
+
+        def _try_add_fetcher(module_name: str, class_name: str, label: str) -> None:
+            try:
+                module = __import__(f"{__package__}.{module_name}", fromlist=[class_name])
+                fetcher_class = getattr(module, class_name)
+                fetchers.append(fetcher_class())
+            except ModuleNotFoundError as exc:
+                logger.warning("%s 依赖缺失，已跳过该数据源: %s", label, exc)
+            except Exception as exc:
+                logger.warning("%s 初始化失败，已跳过该数据源: %s", label, exc)
+
+        _try_add_fetcher("efinance_fetcher", "EfinanceFetcher", "EfinanceFetcher")
+        _try_add_fetcher("akshare_fetcher", "AkshareFetcher", "AkshareFetcher")
+        _try_add_fetcher("tushare_fetcher", "TushareFetcher", "TushareFetcher")
+        _try_add_fetcher("pytdx_fetcher", "PytdxFetcher", "PytdxFetcher")
+        _try_add_fetcher("baostock_fetcher", "BaostockFetcher", "BaostockFetcher")
+        _try_add_fetcher("yfinance_fetcher", "YfinanceFetcher", "YfinanceFetcher")
+        if getattr(config, "joinquant_enabled", False):
+            _try_add_fetcher("joinquant_fetcher", "JoinQuantFetcher", "JoinQuantFetcher")
+
+        self._fetchers = fetchers
 
         # 按优先级排序（Tushare 如果配置了 Token 且初始化成功，优先级为 0）
         self._fetchers.sort(key=lambda f: f.priority)

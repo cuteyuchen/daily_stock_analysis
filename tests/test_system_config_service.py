@@ -58,6 +58,14 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.assertFalse(items["GEMINI_API_KEY"]["is_masked"])
         self.assertTrue(items["GEMINI_API_KEY"]["raw_value_exists"])
 
+    def test_get_config_includes_baidu_search_api_keys_field(self) -> None:
+        payload = self.service.get_config(include_schema=True)
+        items = {item["key"]: item for item in payload["items"]}
+
+        self.assertIn("BAIDU_SEARCH_API_KEYS", items)
+        self.assertEqual(items["BAIDU_SEARCH_API_KEYS"]["schema"]["category"], "data_source")
+        self.assertEqual(items["BAIDU_SEARCH_API_KEYS"]["schema"]["ui_control"], "password")
+
     def test_export_desktop_env_returns_raw_text(self) -> None:
         self.env_path.write_text(
             "# Desktop config\nSTOCK_LIST=600519,000001\n\nGEMINI_API_KEY=secret-key-value\n",
@@ -457,6 +465,35 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.assertTrue(payload["success"])
         self.assertEqual(payload["resolved_protocol"], "openai")
         self.assertEqual(payload["resolved_model"], "openai/deepseek-chat")
+
+    @patch("litellm.completion")
+    def test_test_llm_channel_passes_empty_api_key_for_local_openai_endpoint(self, mock_completion) -> None:
+        def fake_completion(**kwargs):
+            if "api_key" not in kwargs:
+                raise AssertionError("expected api_key to be forwarded for local endpoint")
+            if kwargs["api_key"] != "sk-local-placeholder":
+                raise AssertionError(f"expected placeholder api_key, got {kwargs['api_key']!r}")
+            return type(
+                "MockResponse",
+                (),
+                {
+                    "choices": [type("Choice", (), {"message": type("Message", (), {"content": "OK"})()})()],
+                },
+            )()
+
+        mock_completion.side_effect = fake_completion
+
+        payload = self.service.test_llm_channel(
+            name="local",
+            protocol="openai",
+            base_url="http://127.0.0.1:11434/v1",
+            api_key="",
+            models=["qwen2.5:7b"],
+        )
+
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["resolved_protocol"], "openai")
+        self.assertEqual(payload["resolved_model"], "openai/qwen2.5:7b")
 
     @patch.object(SystemConfigService, "_reload_runtime_singletons")
     def test_update_with_reload_resets_runtime_singletons(

@@ -199,6 +199,25 @@ class LLMChannelConfigTestCase(unittest.TestCase):
 
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_local_openai_compatible_channel_uses_placeholder_api_key_when_empty(self, _mock_parse_yaml, _mock_setup_env) -> None:
+        env = {
+            "LLM_CHANNELS": "local",
+            "LLM_LOCAL_PROTOCOL": "openai",
+            "LLM_LOCAL_BASE_URL": "http://127.0.0.1:8000/v1",
+            "LLM_LOCAL_API_KEY": "",
+            "LLM_LOCAL_MODELS": "my-model",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            config = Config._load_from_env()
+
+        params = config.llm_model_list[0]["litellm_params"]
+        self.assertEqual(params["model"], "openai/my-model")
+        self.assertEqual(params["api_key"], "sk-local-placeholder")
+        self.assertEqual(params["api_base"], "http://127.0.0.1:8000/v1")
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
     def test_agent_model_empty_inherits_primary_model(self, _mock_parse_yaml, _mock_setup_env) -> None:
         env = {
             "OPENAI_API_KEY": "sk-test-value",
