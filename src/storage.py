@@ -205,6 +205,22 @@ class FundamentalSnapshot(Base):
         return f"<FundamentalSnapshot(query_id={self.query_id}, code={self.code})>"
 
 
+class DailyPickRun(Base):
+    """每日热点推荐运行记录。"""
+
+    __tablename__ = 'daily_pick_runs'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    source = Column(String(20), default='manual', index=True)
+    strategy_version = Column(String(32), default='mvp_v1')
+    pick_count = Column(Integer, default=0)
+    market_news_json = Column(Text)
+    sector_rankings_json = Column(Text)
+    recommendations_json = Column(Text)
+    payload_json = Column(Text)
+    generated_at = Column(DateTime, default=datetime.now, index=True)
+
+
 class AnalysisHistory(Base):
     """
     分析结果历史记录模型
