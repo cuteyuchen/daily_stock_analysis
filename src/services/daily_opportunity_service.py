@@ -63,6 +63,25 @@ class DailyOpportunityService:
         "board": 3,
     }
     NEWS_FRESHNESS_DAYS = 7
+    NEWS_PRIORITY_DAYS = 3
+    NEWS_HARD_MAX_DAYS = 7
+    SCORING_WEIGHTS: Dict[str, int] = {
+        "news_policy": 25,
+        "catalyst": 15,
+        "sector_heat": 15,
+        "stock_heat": 10,
+        "technical": 20,
+        "capital_flow": 10,
+        "fundamental": 5,
+    }
+    MAX_RISK_PENALTY = 20
+    SAME_SECTOR_MAX = 2
+    SAME_THEME_MAX = 2
+    HARD_FILTER_MIN_AMOUNT = 2e7  # 成交额硬过滤阈值（元），可通过子类或配置覆盖
+    POLICY_KEYWORDS = (
+        "政策", "国务院", "发改委", "工信部", "证监会", "央行", "财政部",
+        "部署", "规划", "意见", "通知", "纲要", "方案", "补贴", "减税",
+    )
     ROUNDUP_KEYWORDS = ("盘点", "回顾", "复盘", "年终", "年度", "全年", "最强音")
     GENERIC_PORTAL_KEYWORDS = ("最新相关信息",)
     LOW_SIGNAL_SOURCE_KEYWORDS = ("baike.baidu.com", "nourl.ubs.baidu.com", "emdatah5.eastmoney.com")
@@ -730,6 +749,428 @@ class DailyOpportunityService:
             score -= 4
         return round(score, 2)
 
+    # ------------------------------------------------------------------
+    # Dimensional scoring (0-100 each)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _compute_news_policy_score(
+        cls,
+        matched_news: List[Dict[str, Any]],
+        matched_theme_names: List[str],
+    ) -> float:
+        if not matched_news and not matched_theme_names:
+            return 0.0
+
+        now = datetime.now()
+        primary_count = 0  # 0-3 天主窗口新闻数
+        weak_count = 0     # 4-7 天弱辅助新闻数
+        has_policy = False
+        freshness_bonus = 0.0
+
+        for news in matched_news:
+            pub = cls._parse_news_date(news.get("published_date"))
+            if pub is not None:
+                age_days = (now - pub).total_seconds() / 86400
+                if age_days > cls.NEWS_HARD_MAX_DAYS:
+                    continue  # 超过硬上限完全忽略
+            text = f"{news.get('title') or ''} {news.get('snippet') or ''}"
+            if any(kw in text for kw in cls.POLICY_KEYWORDS):
+                has_policy = True
+            if pub is not None:
+                if age_days <= 1:
+                    freshness_bonus = max(freshness_bonus, 25.0)
+                    primary_count += 1
+                elif age_days <= cls.NEWS_PRIORITY_DAYS:
+                    freshness_bonus = max(freshness_bonus, 15.0)
+                    primary_count += 1
+                else:
+                    # 4-7 天：仅做弱辅助，不增加 freshness_bonus
+                    weak_count += 1
+            else:
+                freshness_bonus = max(freshness_bonus, 3.0)
+                weak_count += 1  # 无日期视为弱辅助
+
+        # 数量得分仅基于主窗口新闻
+        score = 0.0
+        if primary_count >= 3:
+            score += 55
+        elif primary_count == 2:
+            score += 40
+        elif primary_count == 1:
+            score += 25
+        elif weak_count > 0:
+            # 仅有弱辅助新闻时给予极低基础分，不能单独支撑强推荐
+            score += min(weak_count, 3) * 5  # 最多 15
+
+        score += freshness_bonus
+        if has_policy:
+            score += 20
+        return min(round(score, 2), 100.0)
+
+    @staticmethod
+    def _compute_catalyst_score(
+        matched_theme_names: List[str],
+        themes: List[Dict[str, Any]],
+    ) -> float:
+        if not matched_theme_names:
+            return 0.0
+        theme_lookup = {str(t.get("name") or "").strip(): t for t in themes}
+        score = 0.0
+        total_hits = 0
+        for name in matched_theme_names:
+            info = theme_lookup.get(name)
+            if info:
+                total_hits += info.get("hits", 0)
+        if total_hits >= 4:
+            score = 70
+        elif total_hits >= 3:
+            score = 55
+        elif total_hits >= 2:
+            score = 40
+        elif total_hits >= 1:
+            score = 25
+        score += min(len(matched_theme_names), 3) * 10
+        return min(round(score, 2), 100.0)
+
+    @staticmethod
+    def _compute_sector_heat_score(
+        sector_name: Optional[str],
+        sector_change_pct: Any,
+        top_sectors: List[Dict[str, Any]],
+    ) -> float:
+        if not sector_name:
+            return 0.0
+        score = 30.0
+        if sector_change_pct is not None:
+            try:
+                pct = float(sector_change_pct)
+                score += min(max(pct, 0.0), 8.0) * 5
+            except (TypeError, ValueError):
+                pass
+        for idx, sector in enumerate(top_sectors):
+            if str(sector.get("name") or "").strip() == sector_name:
+                if idx < 3:
+                    score += 20
+                elif idx < 5:
+                    score += 10
+                elif idx < 8:
+                    score += 5
+                break
+        return min(round(score, 2), 100.0)
+
+    @staticmethod
+    def _compute_stock_heat_score(quote: Dict[str, Any]) -> float:
+        turnover = float(quote.get("turnover_rate") or 0)
+        volume_ratio = float(quote.get("volume_ratio") or 0)
+        amount = float(quote.get("amount") or 0)
+        score = 20.0
+        score += min(turnover, 20.0) * 2
+        if volume_ratio >= 2.0:
+            score += 15
+        elif volume_ratio >= 1.5:
+            score += 10
+        elif volume_ratio >= 1.2:
+            score += 5
+        if amount >= 2e9:
+            score += 15
+        elif amount >= 1e9:
+            score += 10
+        elif amount >= 5e8:
+            score += 5
+        return min(round(score, 2), 100.0)
+
+    @staticmethod
+    def _compute_technical_score(quote: Dict[str, Any]) -> float:
+        change_pct = float(quote.get("change_percent") or 0)
+        volume_ratio = float(quote.get("volume_ratio") or 0)
+        amplitude = float(quote.get("amplitude") or 0)
+        amount = float(quote.get("amount") or 0)
+
+        score = 30.0
+        if 2.0 <= change_pct <= 7.0:
+            score += 30
+        elif 0.5 <= change_pct < 2.0:
+            score += 20
+        elif 7.0 < change_pct < 9.5:
+            score += 10
+        elif change_pct < 0:
+            score -= 10
+
+        if 1.2 <= volume_ratio <= 3.0:
+            score += 15
+        elif volume_ratio > 3.0:
+            score += 5
+
+        if amplitude < 8:
+            score += 10
+        elif amplitude >= 12:
+            score -= 10
+
+        if amount >= 3e8:
+            score += 5
+
+        if change_pct >= 9.5:
+            score -= 20
+        return min(max(round(score, 2), 0.0), 100.0)
+
+    @staticmethod
+    def _compute_capital_flow_score(quote: Dict[str, Any]) -> float:
+        amount = float(quote.get("amount") or 0)
+        turnover = float(quote.get("turnover_rate") or 0)
+        score = 20.0
+        if amount > 0:
+            score += min(math.log10(amount + 1), 11.0) * 5
+        if 3.0 <= turnover <= 15.0:
+            score += 20
+        elif turnover > 15.0:
+            score += 10
+        return min(round(score, 2), 100.0)
+
+    @staticmethod
+    def _compute_fundamental_score(stock_name: str) -> float:
+        """无真实基本面数据接入时返回 0。
+
+        当前尚未对接 PE/PB/ROE 等结构化基本面数据源，因此所有标的
+        基本面维度一律返回 0，不伪装为真实评分。ST 标识仅用于
+        risk_penalty，不在此处重复体现。
+        """
+        return 0.0
+
+    @classmethod
+    def _compute_risk_penalty(cls, candidate: Dict[str, Any]) -> float:
+        quote = candidate.get("quote") or {}
+        stock_name = str(candidate.get("stock_name") or "")
+        change_pct = float(quote.get("change_percent") or 0)
+        amplitude = float(quote.get("amplitude") or 0)
+        amount = float(quote.get("amount") or 0)
+        turnover = float(quote.get("turnover_rate") or 0)
+
+        penalty = 0.0
+        if "ST" in stock_name.upper() or "*ST" in stock_name.upper():
+            return float(cls.MAX_RISK_PENALTY)
+        if change_pct >= 9.5:
+            penalty += 15
+        elif change_pct >= 8.0:
+            penalty += 8
+        if amplitude >= 14:
+            penalty += 5
+        elif amplitude >= 12:
+            penalty += 3
+        if amount > 0 and amount < 5e7:
+            penalty += 5
+        if turnover >= 25:
+            penalty += 3
+        return min(round(penalty, 2), float(cls.MAX_RISK_PENALTY))
+
+    def _compute_score_breakdown(
+        self,
+        candidate: Dict[str, Any],
+        market_news: List[Dict[str, Any]],
+        themes: List[Dict[str, Any]],
+        top_sectors: List[Dict[str, Any]],
+    ) -> Dict[str, float]:
+        quote = candidate.get("quote") or {}
+        matched_news = candidate.get("matched_news") or []
+        matched_theme_names = candidate.get("matched_theme_names") or []
+        sector_name = candidate.get("sector_name")
+        sector_change_pct = candidate.get("sector_change_pct")
+        stock_name = str(candidate.get("stock_name") or "")
+
+        return {
+            "news_policy": self._compute_news_policy_score(matched_news, matched_theme_names),
+            "catalyst": self._compute_catalyst_score(matched_theme_names, themes),
+            "sector_heat": self._compute_sector_heat_score(sector_name, sector_change_pct, top_sectors),
+            "stock_heat": self._compute_stock_heat_score(quote),
+            "technical": self._compute_technical_score(quote),
+            "capital_flow": self._compute_capital_flow_score(quote),
+            "fundamental": self._compute_fundamental_score(stock_name),
+            "fundamental_source": "not_available",
+            "risk_penalty": self._compute_risk_penalty(candidate),
+        }
+
+    def _compute_total_score(self, breakdown: Dict[str, float]) -> float:
+        total = 0.0
+        for key, weight in self.SCORING_WEIGHTS.items():
+            total += breakdown.get(key, 0.0) * weight / 100.0
+        total -= breakdown.get("risk_penalty", 0.0)
+        return round(total, 2)
+
+    # ------------------------------------------------------------------
+    # Hard filters
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _apply_hard_filters(cls, candidates: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]]]:
+        filtered: List[Dict[str, Any]] = []
+        removed: List[Dict[str, str]] = []
+        for c in candidates:
+            name = str(c.get("stock_name") or "")
+            quote = c.get("quote") or {}
+            change_pct = float(quote.get("change_percent") or 0)
+            amount = float(quote.get("amount") or 0)
+            open_price = quote.get("open")
+            high = quote.get("high")
+            low = quote.get("low")
+
+            reason = None
+            if "ST" in name.upper() or "*ST" in name.upper():
+                reason = "ST/*ST 剔除"
+            elif change_pct >= 9.9 and open_price and high and low:
+                try:
+                    if abs(float(high) - float(low)) < 0.02:
+                        reason = "一字板，无法参与"
+                except (TypeError, ValueError):
+                    pass
+                # 非一字板涨停 → 不硬过滤，仅打标（risk_penalty 已覆盖）
+            elif amount > 0 and amount < cls.HARD_FILTER_MIN_AMOUNT:
+                reason = f"成交额过低（<{cls.HARD_FILTER_MIN_AMOUNT / 1e4:.0f}万），流动性严重不足"
+
+            if reason:
+                removed.append({"stock_code": c.get("stock_code", ""), "reason": reason})
+            else:
+                filtered.append(c)
+        return filtered, removed
+
+    # ------------------------------------------------------------------
+    # Diversity constraint
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _normalize_theme(cls, name: str) -> str:
+        """将主题名称归一化到 THEME_ALIASES 中的规范名。
+
+        主题识别链路：
+        1. ``_extract_themes`` 从新闻+板块排行收集候选主题，通过 THEME_ALIASES
+           将别名（如"AI""算力""大模型"）映射回规范名（如"人工智能"）。
+        2. ``_match_sector`` 用个股概念板块匹配 top_sectors / themes，返回的
+           matched_theme_names 可能是板块排行原名（如"AI应用"）而非规范名。
+        3. 本方法用于在多样性去重时再做一次归一化，避免同语义不同名称绕过约束。
+        当 name 不命中任何别名时原样返回——此时该名称自身就是去重 key。
+        """
+        stripped = name.strip()
+        for canonical, aliases in cls.THEME_ALIASES.items():
+            if stripped == canonical:
+                return canonical
+            if any(alias and alias in stripped for alias in aliases):
+                return canonical
+        return stripped
+
+    @classmethod
+    def _diversify_candidates(cls, candidates: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
+        """按板块和主题做多样性约束。
+
+        - sector_name 直接用于板块计数（同名 ≤ SAME_SECTOR_MAX）。
+        - primary_theme 通过 ``_normalize_theme`` 归一化后用于主题计数
+          （同规范主题 ≤ SAME_THEME_MAX），防止同语义不同名称绕过约束。
+        - 被约束跳过的候选进入 deferred 队列；若主队列不足 top_k 则从
+          deferred 按原顺序回填，保证输出数量尽可能满足。
+        """
+        result: List[Dict[str, Any]] = []
+        sector_count: Dict[str, int] = {}
+        theme_count: Dict[str, int] = {}
+        deferred: List[Dict[str, Any]] = []
+
+        for c in candidates:
+            sector = str(c.get("sector_name") or "").strip()
+            themes = c.get("matched_theme_names") or []
+            primary_theme = cls._normalize_theme(themes[0]) if themes else ""
+
+            sector_ok = not sector or sector_count.get(sector, 0) < cls.SAME_SECTOR_MAX
+            theme_ok = not primary_theme or theme_count.get(primary_theme, 0) < cls.SAME_THEME_MAX
+
+            if sector_ok and theme_ok:
+                result.append(c)
+                if sector:
+                    sector_count[sector] = sector_count.get(sector, 0) + 1
+                if primary_theme:
+                    theme_count[primary_theme] = theme_count.get(primary_theme, 0) + 1
+                if len(result) >= top_k:
+                    break
+            else:
+                deferred.append(c)
+
+        if len(result) < top_k:
+            for c in deferred:
+                result.append(c)
+                if len(result) >= top_k:
+                    break
+        return result
+
+    # ------------------------------------------------------------------
+    # Entry hint & tags
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_entry_hint(candidate: Dict[str, Any]) -> str:
+        quote = candidate.get("quote") or {}
+        change_pct = float(quote.get("change_percent") or 0)
+        volume_ratio = float(quote.get("volume_ratio") or 0)
+        amplitude = float(quote.get("amplitude") or 0)
+
+        if change_pct >= 7.0:
+            return "当前涨幅较大，建议观望等回踩确认，不宜追高"
+        if change_pct >= 4.0 and volume_ratio >= 1.5:
+            return "放量上攻中，可考虑轻仓追突破，设好止损"
+        if 1.0 <= change_pct < 4.0 and amplitude < 6:
+            return "温和放量，适合分批建仓，等待进一步确认"
+        if change_pct < 1.0 and volume_ratio >= 1.2:
+            return "缩量回踩或低位蓄势，适合等回踩支撑位介入"
+        return "建议先观察量价配合情况，不急于介入"
+
+    @staticmethod
+    def _build_stop_loss_hint(candidate: Dict[str, Any]) -> str:
+        quote = candidate.get("quote") or {}
+        current_price = quote.get("current_price")
+        prev_close = quote.get("prev_close")
+        low = quote.get("low")
+        if current_price and prev_close:
+            try:
+                stop = round(float(prev_close) * 0.95, 2)
+                return f"建议止损参考：前收价95%附近（约{stop}），或跌破当日低点{low or '--'}"
+            except (TypeError, ValueError):
+                pass
+        return "建议根据个股支撑位和自身风险偏好设定止损"
+
+    @staticmethod
+    def _build_reason_tags(candidate: Dict[str, Any]) -> List[str]:
+        tags: List[str] = []
+        if candidate.get("matched_news"):
+            tags.append("新闻驱动")
+        if candidate.get("matched_theme_names"):
+            tags.append("热点主题")
+        if candidate.get("sector_name"):
+            tags.append("强势板块")
+        quote = candidate.get("quote") or {}
+        change_pct = float(quote.get("change_percent") or 0)
+        volume_ratio = float(quote.get("volume_ratio") or 0)
+        if 2.0 <= change_pct <= 7.0 and volume_ratio >= 1.3:
+            tags.append("量价配合")
+        amount = float(quote.get("amount") or 0)
+        if amount >= 1e9:
+            tags.append("资金活跃")
+        return tags
+
+    @staticmethod
+    def _build_risk_tags(candidate: Dict[str, Any]) -> List[str]:
+        tags: List[str] = []
+        quote = candidate.get("quote") or {}
+        change_pct = float(quote.get("change_percent") or 0)
+        amplitude = float(quote.get("amplitude") or 0)
+        turnover = float(quote.get("turnover_rate") or 0)
+        amount = float(quote.get("amount") or 0)
+        if change_pct >= 8.0:
+            tags.append("追高风险")
+        if amplitude >= 12:
+            tags.append("高振幅")
+        if turnover >= 20:
+            tags.append("高换手")
+        if amount > 0 and amount < 1e8:
+            tags.append("流动性偏弱")
+        if not candidate.get("matched_news"):
+            tags.append("新闻支撑弱")
+        return tags
+
     def _match_sector(
         self,
         boards: List[Dict[str, Any]],
@@ -791,6 +1232,7 @@ class DailyOpportunityService:
                     "boards": [],
                     "matched_news": [],
                     "matched_theme_names": [],
+                    "score_breakdown": {},
                 }
             )
 
@@ -806,12 +1248,6 @@ class DailyOpportunityService:
             if matched_sector:
                 candidate["sector_name"] = matched_sector.get("name")
                 candidate["sector_change_pct"] = matched_sector.get("change_pct")
-                sector_change_pct = matched_sector.get("change_pct")
-                if sector_change_pct is not None:
-                    try:
-                        candidate["score"] += min(max(float(sector_change_pct), -1.0), 8.0) * 2.1
-                    except (TypeError, ValueError):
-                        pass
 
             matched_news = []
             for news in market_news:
@@ -826,11 +1262,16 @@ class DailyOpportunityService:
                     break
             candidate["matched_news"] = matched_news[:3]
 
-            for keyword in matched_keywords:
-                theme_info = theme_lookup.get(keyword)
-                if theme_info:
-                    candidate["score"] += min(theme_info.get("hits", 0), 4) * 2.5
+            breakdown = self._compute_score_breakdown(candidate, market_news, themes, top_sectors)
+            candidate["score_breakdown"] = breakdown
+            candidate["score"] = self._compute_total_score(breakdown)
 
+        logger.info(
+            "候选池构建完成：扫描 %d / enriched %d / 有效 %d",
+            len(scan_pool),
+            len(enrich_targets),
+            sum(1 for c in enrich_targets if c.get("score_breakdown")),
+        )
         candidates.sort(key=lambda item: item.get("score", 0), reverse=True)
         return candidates
 
@@ -848,6 +1289,7 @@ class DailyOpportunityService:
                     "boards": [],
                     "matched_news": [],
                     "matched_theme_names": [],
+                    "score_breakdown": {},
                 }
             )
         return fallback_candidates
@@ -1026,14 +1468,18 @@ class DailyOpportunityService:
             )
 
         prompt_payload = {
-            "task": "请从给定候选中选择更适合做每日热点推荐的股票，并给出结构化理由。只能从候选池中选股，不得虚构股票或数据。",
+            "task": (
+                "以下候选股已由程序按多维评分排序。你的任务是：为每只候选股补充结构化的推荐理由、操作建议、风险提示和新闻关联解释。"
+                "不要改变候选股的排序和选择——排序由程序评分决定，你只负责解释。"
+                "只能从候选池中选股，不得虚构股票或数据。"
+            ),
             "constraints": {
                 "top_k": top_k,
                 "degraded": degraded,
-                "must_cover": ["新闻关联", "技术面", "情绪", "资金", "板块逻辑", "风险提示"],
+                "must_cover": ["新闻关联", "技术面", "情绪", "资金", "板块逻辑", "风险提示", "操作建议"],
                 "output_json_only": True,
-                "fresh_news_only": "只能使用近7天内的热点新闻",
-                "reasoning_order": "先判断热点主题，再映射到板块/概念，再筛选个股",
+                "fresh_news_only": "只能使用近3天内的热点新闻，超过3天需明确标注时效",
+                "do_not_reorder": "禁止重新排序，按给定候选顺序输出",
             },
             "market_news": [
                 {
@@ -1080,10 +1526,10 @@ class DailyOpportunityService:
             },
         }
         return (
-            "你是A股每日热点推荐助手。请基于给定新闻、热点板块与候选股信号，对候选股做更严谨的结构化排序。"
-            "只能使用近7天内的热点新闻，且优先依据热点事件/题材判断可能联动的板块，再解释个股逻辑。"
-            "请先判断热点主题，再映射到板块/概念，再筛选个股。"
-            "禁止输出 Markdown，禁止补充候选池外股票，只返回 JSON。\n"
+            "你是A股每日热点推荐的解释助手。候选股已由程序按多维评分排序完毕，你不需要重新排序。"
+            "你的任务是：为每只候选股生成结构化的推荐理由、操作建议、风险提示和新闻关联解释。"
+            "只能使用近3天内的热点新闻，且优先依据热点事件/题材解释个股入选逻辑。"
+            "禁止输出 Markdown，禁止补充候选池外股票，禁止重新排序，只返回 JSON。\n"
             f"{json.dumps(prompt_payload, ensure_ascii=False)}"
         )
 
@@ -1199,33 +1645,40 @@ class DailyOpportunityService:
                 for item in recommendations
                 if item.get("stock_code")
             }
-            ai_ranked: List[Dict[str, Any]] = []
-            used_codes = set()
+            ai_pick_lookup: Dict[str, Dict[str, Any]] = {}
             for ai_item in payload.get("picks", []):
                 code = normalize_stock_code(str(ai_item.get("stock_code") or ""))
-                if not code or code in used_codes or code not in rec_lookup:
-                    continue
-                merged = dict(rec_lookup[code])
-                if ai_item.get("recommend_reason"):
-                    merged["recommend_reason"] = ai_item.get("recommend_reason")
-                if ai_item.get("operation_advice"):
-                    merged["operation_advice"] = ai_item.get("operation_advice")
-                if ai_item.get("risk_warning"):
-                    merged["risk_warning"] = ai_item.get("risk_warning")
-                if ai_item.get("news_connection"):
-                    merged["news_connection"] = ai_item.get("news_connection")
-                if isinstance(ai_item.get("signal_breakdown"), dict):
-                    merged["signal_breakdown"] = ai_item.get("signal_breakdown")
-                if isinstance(ai_item.get("related_news"), list):
-                    merged["related_news"] = self._merge_ai_related_news(
-                        list(merged.get("related_news") or []),
-                        ai_item.get("related_news") or [],
-                        market_news,
-                    )
-                ai_ranked.append(merged)
-                used_codes.add(code)
+                if code and code in rec_lookup:
+                    ai_pick_lookup[code] = ai_item
 
-            if not ai_ranked:
+            # Preserve programmatic ordering — LLM only enriches explanation fields
+            enriched: List[Dict[str, Any]] = []
+            for item in recommendations:
+                code = normalize_stock_code(str(item.get("stock_code") or ""))
+                merged = dict(item)
+                ai_item = ai_pick_lookup.get(code)
+                if ai_item:
+                    if ai_item.get("recommend_reason"):
+                        merged["recommend_reason"] = ai_item.get("recommend_reason")
+                    if ai_item.get("operation_advice"):
+                        merged["operation_advice"] = ai_item.get("operation_advice")
+                    if ai_item.get("risk_warning"):
+                        merged["risk_warning"] = ai_item.get("risk_warning")
+                    if ai_item.get("news_connection"):
+                        merged["news_connection"] = ai_item.get("news_connection")
+                    if isinstance(ai_item.get("signal_breakdown"), dict):
+                        merged["signal_breakdown"] = ai_item.get("signal_breakdown")
+                    if isinstance(ai_item.get("related_news"), list):
+                        merged["related_news"] = self._merge_ai_related_news(
+                            list(merged.get("related_news") or []),
+                            ai_item.get("related_news") or [],
+                            market_news,
+                        )
+                    if ai_item.get("entry_hint"):
+                        merged["entry_hint"] = ai_item.get("entry_hint")
+                enriched.append(merged)
+
+            if not ai_pick_lookup:
                 summary_bucket.append(
                     {
                         "provider": "DailyPicksAI",
@@ -1236,23 +1689,28 @@ class DailyOpportunityService:
                 )
                 return recommendations
 
-            for item in recommendations:
-                code = normalize_stock_code(str(item.get("stock_code") or ""))
-                if code and code not in used_codes:
-                    ai_ranked.append(item)
-
             summary_bucket.append(
                 {
                     "provider": "DailyPicksAI",
                     "result": "ok",
                     "duration_ms": int((time.time() - start) * 1000),
-                    "selected_count": len(ai_ranked[:top_k]),
+                    "enriched_count": len(ai_pick_lookup),
                     "market_sentiment": payload.get("market_sentiment"),
                     "summary": payload.get("summary"),
                 }
             )
             self._mark_source(ctx, "DailyPicksAI", "ok")
-            return ai_ranked[:top_k]
+            result = enriched[:top_k]
+            for idx, item in enumerate(result, start=1):
+                item["final_rank"] = idx
+            logger.info(
+                "LLM 增强后排序审计：%s",
+                ", ".join(
+                    f"{r.get('stock_code','?')}(program={r.get('program_rank','?')},final={r.get('final_rank','?')})"
+                    for r in result
+                ),
+            )
+            return result
         except Exception as exc:  # noqa: BLE001
             _, reason = summarize_exception(exc)
             summary_bucket.append(
@@ -1318,11 +1776,17 @@ class DailyOpportunityService:
             result.append(
                 {
                     "rank": idx,
+                    "program_rank": idx,
                     "stock_code": candidate.get("stock_code"),
                     "stock_name": candidate.get("stock_name"),
                     "sector_name": sector_name,
                     "sector_change_pct": candidate.get("sector_change_pct"),
                     "score": round(float(candidate.get("score") or 0), 2),
+                    "score_breakdown": candidate.get("score_breakdown") or {},
+                    "reason_tags": self._build_reason_tags(candidate),
+                    "risk_tags": self._build_risk_tags(candidate),
+                    "entry_hint": self._build_entry_hint(candidate),
+                    "stop_loss_hint": self._build_stop_loss_hint(candidate),
                     "recommend_reason": "；".join(reason_parts),
                     "operation_advice": self.DEFAULT_OPERATION_ADVICE,
                     "risk_warning": self.DEFAULT_RISK_WARNING,
@@ -1412,12 +1876,32 @@ class DailyOpportunityService:
         if not top_sectors:
             degraded_reasons.append("板块排行不可用，已回退到全市场简化评分。")
             generation_layer = "market_stock"
+
+        # ---- Hard filter ----
+        pre_filter_count = len(candidates)
+        candidates, removed = self._apply_hard_filters(candidates)
+        if removed:
+            logger.info(
+                "硬过滤剔除 %d 只：%s",
+                len(removed),
+                "; ".join(f"{r['stock_code']}({r['reason']})" for r in removed[:10]),
+            )
+
         if len(candidates) < top_k:
             degraded_reasons.append("有效行情候选不足，已启用真实股票池兜底。")
             generation_layer = "stock_pool_fallback"
             candidates.extend(self._build_stock_pool_fallback(stock_pool, count=max(top_k * 2, 10)))
 
-        recommendations = self._build_recommendations(candidates, market_news, bool(degraded_reasons), top_k)
+        # ---- Diversity ----
+        pre_diverse = candidates[: top_k * 3]
+        diverse_pool = self._diversify_candidates(pre_diverse, top_k * 2)
+        logger.info(
+            "多样性处理：输入 %d → 输出 %d",
+            len(pre_diverse),
+            len(diverse_pool),
+        )
+
+        recommendations = self._build_recommendations(diverse_pool, market_news, bool(degraded_reasons), top_k)
         recommendations = self._apply_ai_reasoning(
             recommendations,
             market_news,
@@ -1430,7 +1914,7 @@ class DailyOpportunityService:
             degraded_reasons.append("输出数量不足，已补充低可信度真实股票候选。")
             fallback_candidates = self._build_stock_pool_fallback(stock_pool, count=top_k)
             recommendations = self._build_recommendations(
-                candidates + fallback_candidates,
+                diverse_pool + fallback_candidates,
                 market_news,
                 True,
                 top_k,
@@ -1443,6 +1927,35 @@ class DailyOpportunityService:
                 top_k=top_k,
                 ctx=ctx,
             )
+
+        # ---- Ensure final_rank is always present (fallback = program_rank) ----
+        for idx, r in enumerate(recommendations[:top_k], start=1):
+            r.setdefault("final_rank", r.get("program_rank", idx))
+
+        # ---- Final logging ----
+        logger.info(
+            "最终 Top%d：%s",
+            top_k,
+            ", ".join(
+                f"{r.get('stock_name', '?')}({r.get('stock_code', '?')}) score={r.get('score', 0)}"
+                for r in recommendations[:top_k]
+            ),
+        )
+        for r in recommendations[:top_k]:
+            bd = r.get("score_breakdown") or {}
+            if bd:
+                logger.info(
+                    "  %s 分项：news=%s catalyst=%s sector=%s stock_heat=%s tech=%s capital=%s fund=%s risk=-%s",
+                    r.get("stock_code", "?"),
+                    bd.get("news_policy", 0),
+                    bd.get("catalyst", 0),
+                    bd.get("sector_heat", 0),
+                    bd.get("stock_heat", 0),
+                    bd.get("technical", 0),
+                    bd.get("capital_flow", 0),
+                    bd.get("fundamental", 0),
+                    bd.get("risk_penalty", 0),
+                )
 
         finished_at = datetime.now()
         duration_ms = int((finished_at - ctx["started_at"]).total_seconds() * 1000)
@@ -1459,17 +1972,18 @@ class DailyOpportunityService:
             "started_at": ctx["started_at"].isoformat(),
             "finished_at": finished_at.isoformat(),
             "duration_ms": duration_ms,
-            "strategy_version": "daily_picks_v2",
+            "strategy_version": "daily_picks_v3",
             "run_status": run_status,
             "degraded": degraded,
             "generation_layer": generation_layer,
             "generation_note": (
-                "daily picks 已切换为分层兜底模式：优先热点+板块共振，失败时自动回退到板块/量价/股票池真实候选。"
+                "daily picks v3：多维评分+硬过滤+多样性约束，LLM仅做解释增强。"
             ),
             "market_news": market_news,
             "themes": themes,
             "sector_rankings": sector_rankings,
-            "candidate_count": len(candidates),
+            "candidate_count": pre_filter_count,
+            "filtered_count": pre_filter_count - len(candidates) + len(removed),
             "output_count": output_count,
             "recommendations": recommendations,
             "confidence": self._overall_confidence(

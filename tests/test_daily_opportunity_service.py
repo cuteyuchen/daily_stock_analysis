@@ -580,8 +580,8 @@ class DailyOpportunityServiceTestCase(unittest.TestCase):
             degraded=False,
         )
 
-        self.assertIn("只能使用近7天内的热点新闻", prompt)
-        self.assertIn("先判断热点主题，再映射到板块/概念，再筛选个股", prompt)
+        self.assertIn("只能使用近3天内的热点新闻", prompt)
+        self.assertIn("禁止重新排序", prompt)
 
     def test_merge_ai_related_news_preserves_url_from_similar_market_news_title(self):
         service = self._build_service(include_news=True, include_sector=True)

@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### 改进
 
+- 🎯 **daily picks v3 多维评分与量化筛选增强** — 热点推荐策略从 `daily_picks_v2` 升级至 `daily_picks_v3`：新增 8 维评分体系（新闻政策、催化事件、板块热度、个股热度、技术面、资金面、基本面、风险惩罚）并输出结构化 `score_breakdown`；新增硬过滤（ST / 一字板 / 极低流动性 / 涨停追高）与板块多样性约束（同板块 ≤ 2、同主题 ≤ 2）；新增 `entry_hint`、`stop_loss_hint`、`reason_tags`、`risk_tags` 等结构化可解释字段；LLM 角色收窄为"解释助手"，不再对程序化排序结果做重排。前端同步展示评分明细、理由/风险标签与参与提示，所有新字段均为可选，API 向下兼容。
+- 🔬 **daily picks v3 评分与审计加固（v3.1）**：
+  - 新闻时效拆分主窗口（≤3 天）与弱辅助窗口（4-7 天），超 `NEWS_HARD_MAX_DAYS`（7 天）新闻完全跳过且不触发政策加分；弱窗口新闻得分上限 15 分，无法单独支撑强推荐。
+  - `_compute_fundamental_score` 在无真实基本面数据源时始终返回 0，并在 `score_breakdown` 标记 `fundamental_source: "not_available"`，不伪装为真实评分。
+  - 硬过滤区分一字板（open≈high≈low）与普通强势涨停，后者不再被一刀切过滤，改由 `risk_penalty` 降分覆盖；流动性阈值提取为 `HARD_FILTER_MIN_AMOUNT` 类常量，可子类覆盖。
+  - 输出新增 `program_rank` / `final_rank` 审计字段，分别记录程序化排序位次与 LLM 增强后最终位次，证明 LLM 不可改变排名。
+  - 新增 `_normalize_theme`，将 `_diversify_candidates` 中的别名（如 "AI应用"→"人工智能"）归一化，避免同语义不同名称绕过板块多样性约束。
 - 📰 **daily picks 搜索与降级链路稳态化** — 新增 `BaiduSearchProvider`，可通过 `BAIDU_SEARCH_API_KEY(S)` / `BAIDU_SEARCH_BASE_URL` / `BAIDU_SEARCH_HTTP_METHOD` 作为中文财经热点搜索主链路，并继续保留 SearXNG 等旧 provider 作为回退；daily picks 生成链路改为“新闻 → 板块 → 个股 → 股票池”分层兜底，不再优先退化成行业占位对象。
 - 🇨🇳 **中文新闻检索优先命中 Baidu 风格结果** — 当运行环境尚未配置直连 `BAIDU_SEARCH_API_KEY` 时，`search_stock_news()` 会优先尝试 `SerpAPI` 的 `baidu` engine，再回退到 Tavily；同时对缺失日期的百度结果补齐当天日期，避免被新闻时效过滤误伤。
 - 🧱 **Tushare / JoinQuant 在 daily picks 中的角色收口** — Tushare 在 daily picks 中显式降为补充源，权限不足或积分受限时只记 warning 并自动跳过；新增 `JoinQuantFetcher` 壳子与 `JOINQUANT_*` 配置，作为可选结构化数据补充源，登录失败或 SDK 缺失时 fail-open。

@@ -312,12 +312,38 @@ const DailyPicksPage: React.FC = () => {
                           {item.confidence ? <Badge variant={badgeVariantForConfidence(item.confidence)}>{item.confidence}</Badge> : null}
                         </div>
                       </div>
+
+                      {item.reasonTags?.length || item.riskTags?.length ? (
+                        <div className="mt-3 flex flex-wrap gap-1.5">
+                          {(item.reasonTags || []).map((tag) => (
+                            <Badge key={tag} variant="success">{tag}</Badge>
+                          ))}
+                          {(item.riskTags || []).map((tag) => (
+                            <Badge key={tag} variant="warning">{tag}</Badge>
+                          ))}
+                        </div>
+                      ) : null}
+
                       <div className="mt-4 grid gap-2 text-xs text-secondary-text sm:grid-cols-2">
                         <div>涨跌幅：{String(quoteMetric(item, 'changePercent') ?? quoteMetric(item, 'change_percent') ?? '--')}</div>
                         <div>成交额：{String(quoteMetric(item, 'amount') ?? '--')}</div>
                         <div>换手率：{String(quoteMetric(item, 'turnoverRate') ?? quoteMetric(item, 'turnover_rate') ?? '--')}</div>
                         <div>量比：{String(quoteMetric(item, 'volumeRatio') ?? quoteMetric(item, 'volume_ratio') ?? '--')}</div>
                       </div>
+
+                      {item.scoreBreakdown && Object.keys(item.scoreBreakdown).length > 0 ? (
+                        <div className="mt-3 grid gap-1.5 text-xs text-secondary-text sm:grid-cols-2">
+                          <div>新闻政策：{item.scoreBreakdown.newsPolicy ?? item.scoreBreakdown.news_policy ?? '--'}</div>
+                          <div>热点催化：{item.scoreBreakdown.catalyst ?? '--'}</div>
+                          <div>板块热度：{item.scoreBreakdown.sectorHeat ?? item.scoreBreakdown.sector_heat ?? '--'}</div>
+                          <div>个股热度：{item.scoreBreakdown.stockHeat ?? item.scoreBreakdown.stock_heat ?? '--'}</div>
+                          <div>技术面：{item.scoreBreakdown.technical ?? '--'}</div>
+                          <div>资金面：{item.scoreBreakdown.capitalFlow ?? item.scoreBreakdown.capital_flow ?? '--'}</div>
+                          <div>基本面：{item.scoreBreakdown.fundamental ?? '--'}</div>
+                          <div>风险扣分：-{item.scoreBreakdown.riskPenalty ?? item.scoreBreakdown.risk_penalty ?? '0'}</div>
+                        </div>
+                      ) : null}
+
                       <div className="mt-4 space-y-3 text-sm">
                         <div>
                           <div className="text-xs uppercase tracking-[0.18em] text-muted-text">新闻关联</div>
@@ -342,6 +368,18 @@ const DailyPicksPage: React.FC = () => {
                           <div className="text-xs uppercase tracking-[0.18em] text-muted-text">操作建议</div>
                           <p className="mt-1 text-secondary-text">{item.operationAdvice || '--'}</p>
                         </div>
+                        {item.entryHint ? (
+                          <div>
+                            <div className="text-xs uppercase tracking-[0.18em] text-muted-text">参与方式</div>
+                            <p className="mt-1 text-secondary-text">{item.entryHint}</p>
+                          </div>
+                        ) : null}
+                        {item.stopLossHint ? (
+                          <div>
+                            <div className="text-xs uppercase tracking-[0.18em] text-muted-text">止损参考</div>
+                            <p className="mt-1 text-secondary-text">{item.stopLossHint}</p>
+                          </div>
+                        ) : null}
                         <div>
                           <div className="text-xs uppercase tracking-[0.18em] text-muted-text">风险提示</div>
                           <p className="mt-1 text-secondary-text">{item.riskWarning || '--'}</p>

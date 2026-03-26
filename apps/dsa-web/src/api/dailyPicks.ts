@@ -19,11 +19,18 @@ export interface DailyPickSummaryItem {
 
 export interface DailyPickRecommendation {
   rank: number;
+  programRank?: number | null;
+  finalRank?: number | null;
   stockCode?: string | null;
   stockName: string;
   sectorName?: string | null;
   sectorChangePct?: number | null;
   score?: number | null;
+  scoreBreakdown?: Record<string, number> | null;
+  reasonTags?: string[] | null;
+  riskTags?: string[] | null;
+  entryHint?: string | null;
+  stopLossHint?: string | null;
   recommendReason?: string;
   operationAdvice?: string;
   riskWarning?: string;
