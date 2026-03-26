@@ -2273,7 +2273,8 @@ class SearchService:
         stock_code: str,
         stock_name: str,
         max_results: int = 5,
-        focus_keywords: Optional[List[str]] = None
+        focus_keywords: Optional[List[str]] = None,
+        days_override: Optional[int] = None,
     ) -> SearchResponse:
         """
         搜索股票相关新闻
@@ -2289,7 +2290,7 @@ class SearchService:
         """
         # 策略窗口优先：ultra_short/short/medium/long = 1/3/7/30 天，
         # 并统一受 NEWS_MAX_AGE_DAYS 上限约束。
-        search_days = self._effective_news_window_days()
+        search_days = max(1, int(days_override)) if days_override is not None else self._effective_news_window_days()
         provider_max_results = self._provider_request_size(max_results)
 
         # 构建搜索查询（优化搜索效果）

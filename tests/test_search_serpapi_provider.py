@@ -15,7 +15,7 @@ if "newspaper" not in sys.modules:
     mock_np.Config = MagicMock()
     sys.modules["newspaper"] = mock_np
 
-from src.search_service import SearchService, SerpAPISearchProvider
+from src.search_service import SearchResponse, SearchResult, SearchService, SerpAPISearchProvider
 
 
 class _FakeGoogleSearch:
@@ -200,6 +200,50 @@ class TestSerpAPISearchProvider(unittest.TestCase):
         self.assertEqual(len(resp.results), 2)
         self.assertEqual(_FakeTavilyClient.search_calls, [])
         self.assertTrue(all(result.published_date for result in resp.results))
+
+    def test_search_stock_news_respects_days_override(self) -> None:
+        class _Provider:
+            name = "FakeNews"
+            is_available = True
+
+            def __init__(self):
+                self.days_calls = []
+
+            def search(self, query, max_results=5, days=7, **_kwargs):
+                self.days_calls.append(days)
+                return SearchResponse(
+                    query=query,
+                    provider=self.name,
+                    success=True,
+                    results=[
+                        SearchResult(
+                            title="A股 热点",
+                            snippet="近一周新闻",
+                            url="https://example.com/news",
+                            source="example.com",
+                            published_date="2026-03-25",
+                        )
+                    ],
+                )
+
+        provider = _Provider()
+        service = SearchService(
+            searxng_public_instances_enabled=False,
+            news_max_age_days=3,
+            news_strategy_profile="short",
+        )
+        service._providers = [provider]
+
+        resp = service.search_stock_news(
+            "market",
+            "A股市场",
+            max_results=3,
+            focus_keywords=["A股", "财经新闻"],
+            days_override=7,
+        )
+
+        self.assertTrue(resp.success)
+        self.assertEqual(provider.days_calls, [7])
 
 
 if __name__ == "__main__":

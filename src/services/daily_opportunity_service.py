@@ -6,8 +6,9 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
@@ -34,9 +35,9 @@ class DailyOpportunityService:
     """稳定优先的每日热点推荐服务。"""
 
     DEFAULT_NEWS_THEMES = [
-        "A股 市场热点",
-        "A股 财经新闻",
-        "A股 热点题材",
+        "A股 热点事件",
+        "A股 热门板块",
+        "A股 产业催化",
         "A股 盘中异动",
     ]
     DEFAULT_OPERATION_ADVICE = (
@@ -61,6 +62,11 @@ class DailyOpportunityService:
         "quote": 3,
         "board": 3,
     }
+    NEWS_FRESHNESS_DAYS = 7
+    ROUNDUP_KEYWORDS = ("盘点", "回顾", "复盘", "年终", "年度", "全年", "最强音")
+    GENERIC_PORTAL_KEYWORDS = ("最新相关信息",)
+    LOW_SIGNAL_SOURCE_KEYWORDS = ("baike.baidu.com", "nourl.ubs.baidu.com", "emdatah5.eastmoney.com")
+    LOW_SIGNAL_TITLE_KEYWORDS = ("走势图", "行情", "资金流向")
 
     def __init__(self):
         self.config = get_config()
@@ -104,6 +110,88 @@ class DailyOpportunityService:
 
     def _append_warning(self, ctx: Dict[str, Any], message: str) -> None:
         self._append_unique(ctx["warnings"], message)
+
+    @classmethod
+    def _parse_news_date(cls, raw_value: Any) -> Optional[datetime]:
+        value = str(raw_value or "").strip()
+        if not value:
+            return None
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
+            try:
+                return datetime.strptime(value, fmt)
+            except ValueError:
+                continue
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    @classmethod
+    def _looks_like_roundup_article(cls, title: str, snippet: str) -> bool:
+        text = f"{title} {snippet}".strip()
+        if not text:
+            return False
+        year_matches = [int(item) for item in re.findall(r"(20\d{2})年", text)]
+        current_year = datetime.now().year
+        has_old_year = any(year < current_year for year in year_matches)
+        has_roundup_keyword = any(keyword in text for keyword in cls.ROUNDUP_KEYWORDS)
+        return has_old_year and has_roundup_keyword
+
+    @classmethod
+    def _looks_like_old_year_article(cls, title: str, snippet: str) -> bool:
+        text = f"{title} {snippet}".strip()
+        if not text:
+            return False
+        year_matches = [int(item) for item in re.findall(r"(20\d{2})年", text)]
+        if not year_matches:
+            return False
+        current_year = datetime.now().year
+        return any(year < current_year for year in year_matches) and current_year not in year_matches
+
+    @classmethod
+    def _looks_like_generic_portal_article(cls, title: str, snippet: str) -> bool:
+        text = f"{title} {snippet}".strip()
+        if not text:
+            return True
+        return any(keyword in text for keyword in cls.GENERIC_PORTAL_KEYWORDS)
+
+    @classmethod
+    def _looks_like_low_signal_source(cls, item: Dict[str, Any]) -> bool:
+        source = str(item.get("source") or "").strip().lower()
+        url = str(item.get("url") or "").strip().lower()
+        text = f"{item.get('title') or ''} {item.get('snippet') or ''}"
+        if "百科" in text:
+            return True
+        return any(keyword in source or keyword in url for keyword in cls.LOW_SIGNAL_SOURCE_KEYWORDS)
+
+    @classmethod
+    def _looks_like_educational_or_tool_article(cls, title: str, snippet: str) -> bool:
+        text = f"{title} {snippet}".strip()
+        if not text:
+            return False
+        if text.startswith("什么是"):
+            return True
+        return any(keyword in text for keyword in cls.LOW_SIGNAL_TITLE_KEYWORDS)
+
+    @classmethod
+    def _is_recent_hotspot_news(cls, item: Dict[str, Any]) -> bool:
+        title = str(item.get("title") or "")
+        snippet = str(item.get("snippet") or "")
+        if (
+            cls._looks_like_roundup_article(title, snippet)
+            or cls._looks_like_old_year_article(title, snippet)
+            or cls._looks_like_generic_portal_article(title, snippet)
+            or cls._looks_like_low_signal_source(item)
+            or cls._looks_like_educational_or_tool_article(title, snippet)
+        ):
+            return False
+
+        published_at = cls._parse_news_date(item.get("published_date"))
+        if published_at is None:
+            return True
+
+        cutoff = datetime.now() - timedelta(days=cls.NEWS_FRESHNESS_DAYS)
+        return published_at >= cutoff
 
     def _mark_source(self, ctx: Dict[str, Any], provider: str, result: str) -> None:
         if result == "ok":
@@ -253,10 +341,7 @@ class DailyOpportunityService:
         return deduped
 
     def _get_stock_pool(self, limit: int, ctx: Dict[str, Any]) -> List[Dict[str, Any]]:
-        pool: List[Dict[str, Any]] = [
-            {"stock_code": normalize_stock_code(code), "stock_name": ""}
-            for code in getattr(self.config, "stock_list", []) or []
-        ]
+        pool: List[Dict[str, Any]] = []
         for fetcher in self._iter_fetchers_for("stock_list"):
             start = time.time()
             try:
@@ -493,6 +578,7 @@ class DailyOpportunityService:
                     stock_name="A股市场",
                     max_results=max_per_query,
                     focus_keywords=query.split(),
+                    days_override=7,
                 )
                 duration_ms = int((time.time() - start) * 1000)
                 ctx["source_summary"]["news"].append(
@@ -538,6 +624,7 @@ class DailyOpportunityService:
                 )
                 self._append_warning(ctx, f"市场新闻搜索失败（{query}）：{reason}")
 
+        items = [item for item in items if self._is_recent_hotspot_news(item)]
         return items[: max_per_query * len(self.DEFAULT_NEWS_THEMES)]
 
     def get_sector_rankings(self, top_n: int, ctx: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
@@ -945,6 +1032,8 @@ class DailyOpportunityService:
                 "degraded": degraded,
                 "must_cover": ["新闻关联", "技术面", "情绪", "资金", "板块逻辑", "风险提示"],
                 "output_json_only": True,
+                "fresh_news_only": "只能使用近7天内的热点新闻",
+                "reasoning_order": "先判断热点主题，再映射到板块/概念，再筛选个股",
             },
             "market_news": [
                 {
@@ -992,6 +1081,8 @@ class DailyOpportunityService:
         }
         return (
             "你是A股每日热点推荐助手。请基于给定新闻、热点板块与候选股信号，对候选股做更严谨的结构化排序。"
+            "只能使用近7天内的热点新闻，且优先依据热点事件/题材判断可能联动的板块，再解释个股逻辑。"
+            "请先判断热点主题，再映射到板块/概念，再筛选个股。"
             "禁止输出 Markdown，禁止补充候选池外股票，只返回 JSON。\n"
             f"{json.dumps(prompt_payload, ensure_ascii=False)}"
         )
@@ -1000,16 +1091,47 @@ class DailyOpportunityService:
         self,
         base_news: List[Dict[str, Any]],
         ai_news: List[Dict[str, Any]],
+        fallback_news: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
+        def normalize_title(value: str) -> str:
+            text = (value or "").strip()
+            return (
+                text.replace("，", ",")
+                .replace("：", ":")
+                .replace("（", "(")
+                .replace("）", ")")
+                .replace(" ", "")
+                .lower()
+            )
+
         merged: List[Dict[str, Any]] = []
-        base_lookup = {
-            str(item.get("title") or "").strip(): dict(item)
-            for item in base_news
-            if str(item.get("title") or "").strip()
-        }
+        news_sources = [base_news]
+        if fallback_news:
+            news_sources.append(fallback_news)
+
+        base_lookup: Dict[str, Dict[str, Any]] = {}
+        normalized_lookup: Dict[str, Dict[str, Any]] = {}
+        for news_items in news_sources:
+            for item in news_items:
+                title = str(item.get("title") or "").strip()
+                if not title:
+                    continue
+                base_lookup.setdefault(title, dict(item))
+                normalized_lookup.setdefault(normalize_title(title), dict(item))
+
         for ai_item in ai_news[:3]:
             title = str(ai_item.get("title") or "").strip()
             item = dict(base_lookup.get(title, {}))
+            if not item and title:
+                normalized_title = normalize_title(title)
+                item = dict(normalized_lookup.get(normalized_title, {}))
+                if not item:
+                    for candidate_title, candidate_item in normalized_lookup.items():
+                        if normalized_title and (
+                            normalized_title in candidate_title or candidate_title in normalized_title
+                        ):
+                            item = dict(candidate_item)
+                            break
             if not item:
                 item = {
                     "title": title or "相关新闻",
@@ -1059,7 +1181,7 @@ class DailyOpportunityService:
                 top_k=top_k,
                 degraded=degraded,
             )
-            response_text = analyzer.generate_text(prompt, max_tokens=2500, temperature=0.2)
+            response_text = analyzer.generate_text(prompt, max_tokens=2500)
             payload = self._extract_json_payload(response_text or "")
             if not payload or not isinstance(payload.get("picks"), list):
                 summary_bucket.append(
@@ -1098,6 +1220,7 @@ class DailyOpportunityService:
                     merged["related_news"] = self._merge_ai_related_news(
                         list(merged.get("related_news") or []),
                         ai_item.get("related_news") or [],
+                        market_news,
                     )
                 ai_ranked.append(merged)
                 used_codes.add(code)

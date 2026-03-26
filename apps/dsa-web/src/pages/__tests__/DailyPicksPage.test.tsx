@@ -87,7 +87,14 @@ describe('DailyPicksPage', () => {
       runStatus: 'success',
       degraded: false,
       confidence: 'high',
-      marketNews: [],
+      marketNews: [
+        {
+          title: '人工智能方向热度升温',
+          url: 'https://example.com/news/1',
+          source: 'example.com',
+          publishedDate: '2026-03-25',
+        },
+      ],
       sourceSummary: {
         news: [],
         sectorRankings: [],
@@ -113,6 +120,7 @@ describe('DailyPicksPage', () => {
           relatedNews: [
             {
               title: '人工智能方向热度升温',
+              url: 'https://example.com/news/1',
               relationReason: '新闻直接提到了算力和大模型催化。',
             },
           ],
@@ -131,5 +139,6 @@ describe('DailyPicksPage', () => {
     expect(screen.getByText(/新闻中提到算力和大模型持续升温，算力一号是直接受益方向。/)).toBeInTheDocument();
     expect(screen.getByText(/新闻直接提到了算力和大模型催化。/)).toBeInTheDocument();
     expect(screen.getByText(/涨幅与量比同步走强。/)).toBeInTheDocument();
+    expect(screen.getAllByRole('link', { name: /人工智能方向热度升温/ })[0]).toHaveAttribute('target', '_blank');
   });
 });

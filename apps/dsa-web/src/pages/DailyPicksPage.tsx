@@ -272,9 +272,21 @@ const DailyPicksPage: React.FC = () => {
                     <div className="space-y-3">
                       {selected.marketNews.slice(0, 6).map((news, index) => {
                         const raw = news as Record<string, unknown>;
+                        const href = String(raw.url || '').trim();
                         return (
                           <div key={`${String(raw.url || raw.title || index)}`} className="rounded-xl border border-border/40 px-3 py-3 text-sm">
-                            <div className="font-medium text-foreground">{String(raw.title || '未命名新闻')}</div>
+                            {href ? (
+                              <a
+                                className="font-medium text-foreground underline decoration-border/60 underline-offset-4 hover:text-cyan"
+                                href={href}
+                                target="_blank"
+                                rel="noreferrer"
+                              >
+                                {String(raw.title || '未命名新闻')}
+                              </a>
+                            ) : (
+                              <div className="font-medium text-foreground">{String(raw.title || '未命名新闻')}</div>
+                            )}
                             <div className="mt-1 text-xs text-secondary-text">
                               {String(raw.source || '--')} · {String(raw.publishedDate || raw.published_date || '--')}
                             </div>
@@ -341,9 +353,21 @@ const DailyPicksPage: React.FC = () => {
                             <div className="mt-1 space-y-1 text-secondary-text">
                               {item.relatedNews.slice(0, 3).map((news, index) => {
                                 const raw = news as Record<string, unknown>;
+                                const href = String(raw.url || '').trim();
                                 return (
                                   <div key={`${item.rank}-${index}`} className="rounded-xl border border-border/40 px-3 py-2">
-                                    <div>{String(raw.title || raw.source || 'news')}</div>
+                                    {href ? (
+                                      <a
+                                        className="underline decoration-border/60 underline-offset-4 hover:text-cyan"
+                                        href={href}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                      >
+                                        {String(raw.title || raw.source || 'news')}
+                                      </a>
+                                    ) : (
+                                      <div>{String(raw.title || raw.source || 'news')}</div>
+                                    )}
                                     {raw.relationReason || raw.relation_reason ? (
                                       <div className="mt-1 text-xs text-muted-text">
                                         关联说明：{String(raw.relationReason || raw.relation_reason)}
