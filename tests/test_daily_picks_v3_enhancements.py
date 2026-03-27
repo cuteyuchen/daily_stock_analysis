@@ -610,5 +610,82 @@ class IntegrationTestCase(unittest.TestCase):
         fake_notifier.send.assert_called_once()
 
 
+class TestNonStockFiltering(unittest.TestCase):
+    """验证退市股、指数、ETF 等非个股标的被正确过滤。"""
+
+    def test_is_non_stock_target(self):
+        svc = DailyOpportunityService
+        # 退市股
+        self.assertTrue(svc._is_non_stock_target("新都退"))
+        self.assertTrue(svc._is_non_stock_target("退市海润"))
+        # 指数
+        self.assertTrue(svc._is_non_stock_target("上证50指数"))
+        self.assertTrue(svc._is_non_stock_target("上证全指"))  # "指" alone doesn't match, need "指数"
+        # ETF / 基金
+        self.assertTrue(svc._is_non_stock_target("沪深300ETF"))
+        self.assertTrue(svc._is_non_stock_target("证券ETF"))
+        self.assertTrue(svc._is_non_stock_target("易方达创业板LOF"))
+        self.assertTrue(svc._is_non_stock_target("华夏债券基金"))
+        self.assertTrue(svc._is_non_stock_target("国债转债"))
+        # 正常个股 → 不应被过滤
+        self.assertFalse(svc._is_non_stock_target("贵州茅台"))
+        self.assertFalse(svc._is_non_stock_target("中兴通讯"))
+        self.assertFalse(svc._is_non_stock_target("比亚迪"))
+        # ST 由 _apply_hard_filters 处理，此处不应判为 non-stock
+        self.assertFalse(svc._is_non_stock_target("*ST德奥"))
+        # 空名称
+        self.assertFalse(svc._is_non_stock_target(""))
+
+    def test_hard_filter_removes_index_and_delisted(self):
+        candidates = [
+            {"stock_code": "000016", "stock_name": "上证50指数", "quote": {}},
+            {"stock_code": "000033", "stock_name": "新都退", "quote": {}},
+            {"stock_code": "600519", "stock_name": "贵州茅台", "quote": {"change_percent": 2.0, "amount": 5e8}},
+        ]
+        filtered, removed = DailyOpportunityService._apply_hard_filters(candidates)
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0]["stock_code"], "600519")
+        removed_codes = {r["stock_code"] for r in removed}
+        self.assertIn("000016", removed_codes)
+        self.assertIn("000033", removed_codes)
+
+    def test_normalize_stock_rows_filters_non_stocks(self):
+        df = pd.DataFrame({
+            "code": ["600519", "000016", "000033", "512880", "300750"],
+            "name": ["贵州茅台", "上证50指数", "新都退", "证券ETF", "宁德时代"],
+        })
+        rows = DailyOpportunityService._normalize_stock_rows(df, limit=100)
+        codes = [r["stock_code"] for r in rows]
+        self.assertIn("600519", codes)
+        self.assertIn("300750", codes)
+        self.assertNotIn("000016", codes)
+        self.assertNotIn("000033", codes)
+        self.assertNotIn("512880", codes)
+
+    def test_reorder_scan_pool_prioritizes_theme_stocks(self):
+        pool = [
+            {"stock_code": "000001", "stock_name": "平安银行"},
+            {"stock_code": "000002", "stock_name": "万科A"},
+            {"stock_code": "300024", "stock_name": "机器人"},
+            {"stock_code": "300124", "stock_name": "汇川技术"},
+            {"stock_code": "688111", "stock_name": "金山办公"},
+        ]
+        themes = [
+            {"name": "人工智能", "hits": 5},
+            {"name": "半导体", "hits": 2},
+        ]
+        news = [
+            {"title": "金山办公688111发布AI新品", "snippet": ""},
+        ]
+        result = DailyOpportunityService._reorder_scan_pool(pool, themes, news, limit=100)
+        codes = [r["stock_code"] for r in result]
+        # 688111 在新闻中被提及 → 排第一
+        self.assertEqual(codes[0], "688111")
+        # 机器人 匹配 "机器人"（人工智能别名）→ 排在银行/万科之前
+        robot_idx = codes.index("300024")
+        bank_idx = codes.index("000001")
+        self.assertLess(robot_idx, bank_idx)
+
+
 if __name__ == "__main__":
     unittest.main()

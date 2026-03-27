@@ -86,6 +86,24 @@ class DailyOpportunityService:
     GENERIC_PORTAL_KEYWORDS = ("最新相关信息",)
     LOW_SIGNAL_SOURCE_KEYWORDS = ("baike.baidu.com", "nourl.ubs.baidu.com", "emdatah5.eastmoney.com")
     LOW_SIGNAL_TITLE_KEYWORDS = ("走势图", "行情", "资金流向")
+    # 非个股标的关键词 —— 用于股票池过滤与硬过滤
+    NON_STOCK_NAME_KEYWORDS = ("指数", "ETF", "LOF", "基金", "债券", "权证", "转债")
+    NON_STOCK_NAME_PATTERN = re.compile(r"指$|全指$|综指$")
+    DELISTED_NAME_PATTERN = re.compile(r"退$|退市")
+
+    @classmethod
+    def _is_non_stock_target(cls, name: str) -> bool:
+        """判断是否为非个股标的（指数、ETF、退市股等），用于候选池过滤。"""
+        if not name:
+            return False
+        upper = name.upper()
+        if "ST" in upper:
+            return False  # ST 由 _apply_hard_filters 处理
+        if cls.DELISTED_NAME_PATTERN.search(name):
+            return True
+        if cls.NON_STOCK_NAME_PATTERN.search(name):
+            return True
+        return any(kw in name or kw in upper for kw in cls.NON_STOCK_NAME_KEYWORDS)
 
     def __init__(self):
         self.config = get_config()
@@ -303,8 +321,8 @@ class DailyOpportunityService:
         fetchers = [fetcher for fetcher in getattr(self.manager, "_fetchers", []) if hasattr(fetcher, capability)]
         return self._sort_fetchers(fetchers, kind)
 
-    @staticmethod
-    def _normalize_stock_rows(df: pd.DataFrame, limit: int) -> List[Dict[str, Any]]:
+    @classmethod
+    def _normalize_stock_rows(cls, df: pd.DataFrame, limit: int) -> List[Dict[str, Any]]:
         if df is None or df.empty:
             return []
         code_col = None
@@ -334,10 +352,13 @@ class DailyOpportunityService:
             code = normalize_stock_code(str(row.get(code_col) or "").strip())
             if not code:
                 continue
+            stock_name = str(row.get(name_col) or "").strip() if name_col else ""
+            if cls._is_non_stock_target(stock_name):
+                continue
             rows.append(
                 {
                     "stock_code": code[-6:] if code[-6:].isdigit() else code,
-                    "stock_name": str(row.get(name_col) or "").strip() if name_col else "",
+                    "stock_name": stock_name,
                 }
             )
         return rows
@@ -1022,7 +1043,9 @@ class DailyOpportunityService:
             low = quote.get("low")
 
             reason = None
-            if "ST" in name.upper() or "*ST" in name.upper():
+            if cls._is_non_stock_target(name):
+                reason = "非个股标的（指数/ETF/退市等），剔除"
+            elif "ST" in name.upper() or "*ST" in name.upper():
                 reason = "ST/*ST 剔除"
             elif change_pct >= 9.9 and open_price and high and low:
                 try:
@@ -1209,6 +1232,79 @@ class DailyOpportunityService:
                 return {"name": theme_name, "change_pct": None}, matched_keywords
         return None, matched_keywords
 
+    # ------------------------------------------------------------------
+    # Theme-driven scan pool reordering
+    # ------------------------------------------------------------------
+
+    _NEWS_STOCK_CODE_RE = re.compile(r"(?<!\d)(6\d{5}|0\d{5}|3\d{5})(?!\d)")
+
+    @classmethod
+    def _extract_codes_from_news(cls, market_news: List[Dict[str, Any]]) -> List[str]:
+        """从新闻标题/摘要中提取可能的 A 股代码。"""
+        codes: list[str] = []
+        seen: set[str] = set()
+        for news in market_news:
+            text = f"{news.get('title') or ''} {news.get('snippet') or ''}"
+            for m in cls._NEWS_STOCK_CODE_RE.finditer(text):
+                code = m.group(1)
+                if code not in seen:
+                    seen.add(code)
+                    codes.append(code)
+        return codes
+
+    @classmethod
+    def _reorder_scan_pool(
+        cls,
+        stock_pool: List[Dict[str, Any]],
+        themes: List[Dict[str, Any]],
+        market_news: List[Dict[str, Any]],
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """将股票池按主题相关度重排，让热点关联股票优先被扫描。
+
+        策略：
+        1. 从新闻中提取 A 股代码 → 第一优先队列（直接被新闻提及）
+        2. 股票名称/代码部分匹配 theme 名称或 THEME_ALIASES 别名 → 第二优先队列
+        3. 其余股票保持原有顺序 → 第三队列
+        """
+        theme_keywords: set[str] = set()
+        for theme in themes:
+            name = str(theme.get("name") or "").strip()
+            if name and theme.get("hits", 0) > 0:
+                theme_keywords.add(name)
+        for canonical, aliases in cls.THEME_ALIASES.items():
+            if canonical in theme_keywords:
+                theme_keywords.update(aliases)
+
+        news_codes = set(cls._extract_codes_from_news(market_news))
+
+        priority_1: List[Dict[str, Any]] = []  # 新闻直接提及
+        priority_2: List[Dict[str, Any]] = []  # 名称匹配热点主题
+        priority_3: List[Dict[str, Any]] = []  # 其他
+
+        pool_codes_seen: set[str] = set()
+        for item in stock_pool:
+            code = item.get("stock_code", "")
+            if code in pool_codes_seen:
+                continue
+            pool_codes_seen.add(code)
+            name = item.get("stock_name", "")
+
+            if code in news_codes or code[-6:] in news_codes:
+                priority_1.append(item)
+            elif theme_keywords and any(kw in name for kw in theme_keywords):
+                priority_2.append(item)
+            else:
+                priority_3.append(item)
+
+        reordered = priority_1 + priority_2 + priority_3
+        if priority_1 or priority_2:
+            logger.info(
+                "主题驱动重排：新闻提及 %d 只，名称匹配主题 %d 只，其余 %d 只",
+                len(priority_1), len(priority_2), len(priority_3),
+            )
+        return reordered[:limit]
+
     def _build_market_candidates(
         self,
         stock_pool: List[Dict[str, Any]],
@@ -1222,17 +1318,21 @@ class DailyOpportunityService:
         candidates: List[Dict[str, Any]] = []
 
         self._warm_quote_cache([item["stock_code"] for item in stock_pool[:8]], ctx)
-        scan_pool = stock_pool[: self.QUOTE_SCAN_LIMIT]
+        scan_pool = self._reorder_scan_pool(stock_pool, themes, market_news, self.QUOTE_SCAN_LIMIT)
 
         for item in scan_pool:
             quote = self._get_quote(item["stock_code"], item.get("stock_name", ""), ctx, quote_cache)
             if not quote or not quote.get("current_price"):
                 continue
 
+            resolved_name = quote.get("stock_name") or item.get("stock_name") or item["stock_code"]
+            if self._is_non_stock_target(resolved_name):
+                continue
+
             candidates.append(
                 {
                     "stock_code": item["stock_code"],
-                    "stock_name": quote.get("stock_name") or item.get("stock_name") or item["stock_code"],
+                    "stock_name": resolved_name,
                     "quote": quote,
                     "score": self._base_quote_score(quote),
                     "sector_name": None,
@@ -1285,11 +1385,14 @@ class DailyOpportunityService:
 
     def _build_stock_pool_fallback(self, stock_pool: List[Dict[str, Any]], count: int) -> List[Dict[str, Any]]:
         fallback_candidates: List[Dict[str, Any]] = []
-        for item in stock_pool[:count]:
+        for item in stock_pool:
+            name = item.get("stock_name") or item["stock_code"]
+            if self._is_non_stock_target(name):
+                continue
             fallback_candidates.append(
                 {
                     "stock_code": item["stock_code"],
-                    "stock_name": item.get("stock_name") or item["stock_code"],
+                    "stock_name": name,
                     "quote": {},
                     "score": 42.0,
                     "sector_name": None,
@@ -1300,6 +1403,8 @@ class DailyOpportunityService:
                     "score_breakdown": {},
                 }
             )
+            if len(fallback_candidates) >= count:
+                break
         return fallback_candidates
 
     @staticmethod
