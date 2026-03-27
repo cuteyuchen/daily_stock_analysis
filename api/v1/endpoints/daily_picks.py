@@ -48,3 +48,11 @@ def get_daily_pick_detail(record_id: int):
     if item is None:
         raise HTTPException(status_code=404, detail='record not found')
     return item
+
+
+@router.delete('/{record_id}')
+def delete_daily_pick(record_id: int):
+    repo = DailyPicksRepository()
+    if not repo.delete_run(record_id):
+        raise HTTPException(status_code=404, detail='record not found')
+    return {'ok': True, 'deleted_id': record_id}

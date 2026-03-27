@@ -112,6 +112,18 @@ const DailyPicksPage: React.FC = () => {
     }
   }, [loadDetail, loadList]);
 
+  const handleDelete = useCallback(async (id: number) => {
+    if (!window.confirm(`确认删除记录 #${id}？`)) return;
+    setError(null);
+    try {
+      await dailyPicksApi.deleteRun(id);
+      if (selected?.id === id) setSelected(null);
+      await loadList(page);
+    } catch (err) {
+      setError(getParsedApiError(err));
+    }
+  }, [loadList, page, selected]);
+
   useEffect(() => {
     document.title = '热点推荐 - DSA';
     void loadList(page);
@@ -177,22 +189,32 @@ const DailyPicksPage: React.FC = () => {
       </div>
 
       <div className="grid gap-6 lg:grid-cols-[360px_minmax(0,1fr)]">
-        <Card title="历史记录" subtitle="runs" className="min-h-[560px]">
+        <Card title="历史记录" subtitle="runs" className="min-h-140">
           <div className="space-y-3">
             {items.map((item) => {
               const active = selected?.id === item.id;
               return (
-                <button
+                <div
                   key={item.id}
-                  type="button"
+                  className={`relative w-full rounded-2xl border p-4 text-left transition-all cursor-pointer ${active ? 'border-cyan/40 bg-cyan/10' : 'border-border/50 bg-elevated/30 hover:border-border hover:bg-hover'}`}
                   onClick={() => void loadDetail(item.id)}
-                  className={`w-full rounded-2xl border p-4 text-left transition-all ${active ? 'border-cyan/40 bg-cyan/10' : 'border-border/50 bg-elevated/30 hover:border-border hover:bg-hover'}`}
+                  onKeyDown={(e) => { if (e.key === 'Enter') void loadDetail(item.id); }}
+                  role="button"
+                  tabIndex={0}
                 >
                   <div className="flex items-center justify-between gap-3">
                     <div className="text-sm font-semibold text-foreground">#{item.id}</div>
-                    <div className="flex flex-wrap gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
                       <Badge variant={badgeVariantForStatus(item.runStatus)}>{item.runStatus || 'unknown'}</Badge>
                       {item.degraded ? <Badge variant="warning">degraded</Badge> : null}
+                      <button
+                        type="button"
+                        title="删除此记录"
+                        className="ml-1 rounded-lg p-1 text-xs text-secondary-text opacity-50 transition-opacity hover:bg-danger/10 hover:text-danger hover:opacity-100"
+                        onClick={(e) => { e.stopPropagation(); void handleDelete(item.id); }}
+                      >
+                        ✕
+                      </button>
                     </div>
                   </div>
                   <div className="mt-2 text-xs text-secondary-text">{formatDateTime(item.generatedAt)}</div>
@@ -204,7 +226,7 @@ const DailyPicksPage: React.FC = () => {
                       <Badge key={name} variant="history">{name}</Badge>
                     ))}
                   </div>
-                </button>
+                </div>
               );
             })}
 

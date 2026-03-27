@@ -40,7 +40,7 @@ def _write_latest_snapshot(payload: Dict[str, Any]) -> None:
 def _run_generation(queue: mp.Queue) -> None:
     try:
         service = DailyOpportunityService()
-        queue.put({"ok": True, "payload": service.generate_and_save(top_k=5, source="scheduled")})
+        queue.put({"ok": True, "payload": service.generate_and_notify(top_k=5, source="scheduled")})
     except Exception as exc:  # noqa: BLE001
         queue.put({"ok": False, "error": str(exc)})
 

@@ -562,6 +562,20 @@ class IntegrationTestCase(unittest.TestCase):
         stock_names = [r["stock_name"] for r in payload["recommendations"]]
         self.assertNotIn("*ST退市", stock_names)
 
+    def test_filtered_count_not_distorted_by_fallback(self):
+        """fallback 补候选后，filtered_count 仍应只统计硬过滤阶段的剔除数量。"""
+        quotes = {
+            "600001": {"stock_name": "*ST退市", "current_price": 3, "change_percent": 1, "amount": 5e7, "turnover_rate": 5, "volume_ratio": 1.0, "amplitude": 3, "open": 3, "high": 3.1, "low": 2.9, "prev_close": 3.0},
+            "600002": {"stock_name": "正常股票", "current_price": 15, "change_percent": 4, "amount": 8e8, "turnover_rate": 10, "volume_ratio": 1.5, "amplitude": 5, "open": 14.5, "high": 15.2, "low": 14.3, "prev_close": 14.4},
+        }
+        boards = {"600001": ["风险板块"], "600002": ["人工智能"]}
+        service = _build_service(quotes, boards)
+        payload = service.generate_recommendations(top_k=5)
+
+        # pre_filter_count=2，硬过滤仅剔除 *ST 一只；后续 fallback 不应改变 filtered_count
+        self.assertEqual(payload.get("candidate_count"), 2)
+        self.assertEqual(payload.get("filtered_count"), 1)
+
     def test_llm_failure_does_not_break_pipeline(self):
         quotes = {
             "600001": {"stock_name": "算力一号", "current_price": 12, "change_percent": 5, "amount": 8e8, "turnover_rate": 10, "volume_ratio": 1.8, "amplitude": 5, "open": 11.5, "high": 12.5, "low": 11.3, "prev_close": 11.6},
@@ -576,6 +590,24 @@ class IntegrationTestCase(unittest.TestCase):
 
         self.assertEqual(payload["output_count"], 2)
         self.assertTrue(all(r.get("stock_code") for r in payload["recommendations"]))
+
+    def test_generate_and_notify_sends_when_channel_available(self):
+        service = _build_service(
+            quotes={
+                "600001": {"stock_name": "算力一号", "current_price": 12, "change_percent": 5, "amount": 8e8, "turnover_rate": 10, "volume_ratio": 1.8, "amplitude": 5, "open": 11.5, "high": 12.5, "low": 11.3, "prev_close": 11.6},
+                "600002": {"stock_name": "半导体一号", "current_price": 18, "change_percent": 3.5, "amount": 5e8, "turnover_rate": 7, "volume_ratio": 1.4, "amplitude": 4, "open": 17.5, "high": 18.2, "low": 17.3, "prev_close": 17.4},
+            },
+            boards={"600001": ["人工智能"], "600002": ["半导体"]},
+        )
+
+        fake_notifier = MagicMock()
+        fake_notifier.is_available.return_value = True
+        fake_notification_module = SimpleNamespace(get_notification_service=lambda: fake_notifier)
+        with patch.dict(sys.modules, {"src.notification": fake_notification_module}):
+            payload = service.generate_and_notify(top_k=2, source="scheduled")
+
+        self.assertEqual(payload.get("output_count"), 2)
+        fake_notifier.send.assert_called_once()
 
 
 if __name__ == "__main__":

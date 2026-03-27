@@ -26,7 +26,7 @@ export interface DailyPickRecommendation {
   sectorName?: string | null;
   sectorChangePct?: number | null;
   score?: number | null;
-  scoreBreakdown?: Record<string, number> | null;
+  scoreBreakdown?: Record<string, number | string> | null;
   reasonTags?: string[] | null;
   riskTags?: string[] | null;
   entryHint?: string | null;
@@ -100,5 +100,9 @@ export const dailyPicksApi = {
   async getDetail(recordId: number): Promise<DailyPickDetail> {
     const response = await apiClient.get(`/api/v1/daily-picks/${recordId}`);
     return toCamelCase<DailyPickDetail>(response.data);
+  },
+
+  async deleteRun(recordId: number): Promise<void> {
+    await apiClient.delete(`/api/v1/daily-picks/${recordId}`);
   },
 };

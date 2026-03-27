@@ -759,6 +759,14 @@ class DailyOpportunityService:
         matched_news: List[Dict[str, Any]],
         matched_theme_names: List[str],
     ) -> float:
+        """计算新闻政策维度得分。
+
+        新闻窗口策略（最终设计）：
+        - 搜索窗口 = ``NEWS_FRESHNESS_DAYS`` (7 天)
+        - 主窗口 ≤ ``NEWS_PRIORITY_DAYS`` (3 天)：高权重，freshness_bonus 最高 25
+        - 弱辅助窗口 4-7 天：仅弱补充，得分上限 15，无 freshness_bonus
+        - > ``NEWS_HARD_MAX_DAYS`` (7 天)：完全忽略，不计入任何维度
+        """
         if not matched_news and not matched_theme_names:
             return 0.0
 
@@ -1832,7 +1840,7 @@ class DailyOpportunityService:
             "started_at": started.isoformat(),
             "finished_at": finished.isoformat(),
             "duration_ms": duration_ms,
-            "strategy_version": "daily_picks_v2",
+            "strategy_version": "daily_picks_v3",
             "run_status": "failed",
             "degraded": True,
             "generation_layer": "failed",
@@ -1880,6 +1888,7 @@ class DailyOpportunityService:
         # ---- Hard filter ----
         pre_filter_count = len(candidates)
         candidates, removed = self._apply_hard_filters(candidates)
+        post_filter_count = len(candidates)
         if removed:
             logger.info(
                 "硬过滤剔除 %d 只：%s",
@@ -1983,7 +1992,7 @@ class DailyOpportunityService:
             "themes": themes,
             "sector_rankings": sector_rankings,
             "candidate_count": pre_filter_count,
-            "filtered_count": pre_filter_count - len(candidates) + len(removed),
+            "filtered_count": pre_filter_count - post_filter_count,
             "output_count": output_count,
             "recommendations": recommendations,
             "confidence": self._overall_confidence(
@@ -2009,3 +2018,60 @@ class DailyOpportunityService:
         record_id = self.repo.save_run(payload, source=source)
         payload["record_id"] = record_id
         return payload
+
+    def generate_and_notify(self, top_k: int = 5, source: str = "scheduled") -> Dict[str, Any]:
+        """生成推荐、落库并推送到已配置的通知渠道。"""
+        payload = self.generate_and_save(top_k=top_k, source=source)
+        try:
+            from src.notification import get_notification_service
+            notifier = get_notification_service()
+            if notifier.is_available() and payload.get("output_count", 0) > 0:
+                content = self._format_notification(payload)
+                notifier.send(content)
+                logger.info("daily picks 推送完成")
+            elif not notifier.is_available():
+                logger.info("通知渠道未配置，跳过 daily picks 推送")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("daily picks 推送失败（不影响生成结果）: %s", exc)
+        return payload
+
+    @staticmethod
+    def _format_notification(payload: Dict[str, Any]) -> str:
+        """将推荐结果格式化为 Markdown 通知文本。"""
+        lines = ["## 每日热点推荐\n"]
+        generated_at = payload.get("generated_at", "")
+        if generated_at:
+            lines.append(f"**生成时间**：{generated_at[:19].replace('T', ' ')}\n")
+
+        recommendations = payload.get("recommendations") or []
+        for rec in recommendations[:5]:
+            rank = rec.get("rank", "?")
+            name = rec.get("stock_name", "?")
+            code = rec.get("stock_code", "?")
+            score = rec.get("score", "--")
+            sector = rec.get("sector_name", "")
+            reason = rec.get("recommend_reason", "")
+            entry = rec.get("entry_hint", "")
+            risk = rec.get("risk_warning", "")
+
+            lines.append(f"### {rank}. {name}（{code}）")
+            if sector:
+                lines.append(f"- 板块：{sector}")
+            lines.append(f"- 综合评分：{score}")
+            if reason:
+                lines.append(f"- 推荐理由：{reason}")
+            if entry:
+                lines.append(f"- 参与方式：{entry}")
+            if risk:
+                lines.append(f"- 风险提示：{risk}")
+            lines.append("")
+
+        confidence = payload.get("confidence", "")
+        risk_note = payload.get("risk_note", "")
+        if confidence:
+            lines.append(f"**可信度**：{confidence}")
+        if risk_note:
+            lines.append(f"**风险说明**：{risk_note}")
+
+        lines.append("\n> 以上为程序化评分结果，仅供参考，不构成投资建议。")
+        return "\n".join(lines)

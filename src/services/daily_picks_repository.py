@@ -23,7 +23,7 @@ class DailyPicksRepository:
         recommendations = payload.get("recommendations") or []
         record = DailyPickRun(
             source=source,
-            strategy_version=str(payload.get("strategy_version") or "daily_picks_v2"),
+            strategy_version=str(payload.get("strategy_version") or "daily_picks_v3"),
             generated_at=datetime.now(),
             pick_count=int(payload.get("output_count") or len(recommendations)),
             market_news_json=json.dumps(payload.get("market_news") or [], ensure_ascii=False),
@@ -64,6 +64,21 @@ class DailyPicksRepository:
             if row is None:
                 return None
             return self._to_detail(row)
+
+    def delete_run(self, record_id: int) -> bool:
+        """删除指定 id 的推荐记录，成功返回 True。"""
+        with self.db.get_session() as session:
+            row = session.get(DailyPickRun, record_id)
+            if row is None:
+                return False
+            try:
+                session.delete(row)
+                session.commit()
+                return True
+            except Exception as exc:  # noqa: BLE001
+                session.rollback()
+                logger.error("删除 daily picks 记录失败: %s", exc, exc_info=True)
+                return False
 
     @staticmethod
     def _safe_payload(row: DailyPickRun) -> Dict[str, Any]:
